@@ -1,0 +1,9 @@
+langgraph
+langchain-google-genai
+google-cloud-bigquery
+pandas
+python-dotenv
+langchain-core
+db-dtypes==1.2.0 
+typing_extensions
+pytest
