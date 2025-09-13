@@ -1,73 +1,99 @@
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.prompts import ChatPromptTemplate
+import json
 from state import AgentState
 from sub_agents import segmentation_agent, trends_agent, geo_agent, product_agent
-from tools import create_handoff_tool
 from config import get_llm
 
 llm = get_llm()
 
-# Manager Prompt (PRD 3.3)
+# Manager Prompt (simple classification)
 manager_prompt = ChatPromptTemplate.from_template("""
 You are ManagerAgent. Classify the latest human message in {messages}.
-Steps:
-1. Parse for analysis type: segmentation (behavior/demographics), trends (sales/seasonality), geo (location), product (performance/recs).
-2. Select 1-4 sub-agents (e.g., 'trends' for seasonality).
-3. If multi, sequence (trends first for context).
-4. Call handoff tool to delegate.
-5. After subs, set next='synthesis'.
-Edge: Vague? Reply 'Clarify prompt'.
-Once done, return 'complete'.
+Output **only** "next: [agent_name]" where agent_name is one of: segmentation, trends, geo, product, or synthesis if done.
+Example: For "sales trends", output "next: trends".
+Example: For "customer segmentation", output "next: segmentation".
+Example: For vague, output "next: synthesis".
 """)
 
 def manager_node(state: AgentState):
-    manager = create_react_agent(
-        llm,
-        tools=[create_handoff_tool("segmentation"), create_handoff_tool("trends"), 
-               create_handoff_tool("geo"), create_handoff_tool("product")],
-        prompt=manager_prompt
-    )
-    result = manager.invoke(state)
-    state["next"] = "synthesis" if "complete" in str(result) else result.get("next", "trends")  # Parse from result
-    state["messages"] = result["messages"]
+    # Trim messages to last 3 to prevent token bloat
+    trimmed_messages = state["messages"][-3:]
+    formatted_prompt = manager_prompt.format(messages=trimmed_messages)
+    response = llm.invoke(formatted_prompt)
+    final_content = response.content.strip()
+    if "next: " in final_content:
+        next_agent = final_content.split("next: ")[1].strip()
+    else:
+        next_agent = "synthesis"
+    print(f"Manager delegated to: {next_agent}")  # Debug
+    state["next"] = next_agent
+    state["messages"] = trimmed_messages + [response]  # Append response, keep trimmed
     return state
 
 def segmentation_node(state: AgentState):
-    result = segmentation_agent.invoke(state)
+    # Trim before sub-agent
+    trimmed_state = state.copy()
+    trimmed_state["messages"] = state["messages"][-5:]
+    result = segmentation_agent.invoke(trimmed_state)
     state["insights"].append({"agent": "Segmentation", "text": result["messages"][-1].content})
+    state["next"] = "synthesis"  # Force to synthesis
+    state["messages"] = result["messages"][-5:]  # Trim after
     return state
 
 def trends_node(state: AgentState):
-    result = trends_agent.invoke(state)
+    # Trim before sub-agent
+    trimmed_state = state.copy()
+    trimmed_state["messages"] = state["messages"][-5:]
+    result = trends_agent.invoke(trimmed_state)
     state["insights"].append({"agent": "Trends", "text": result["messages"][-1].content})
+    state["next"] = "synthesis"  # Force to synthesis
+    state["messages"] = result["messages"][-5:]  # Trim after
     return state
 
 def geo_node(state: AgentState):
-    result = geo_agent.invoke(state)
+    # Trim before sub-agent
+    trimmed_state = state.copy()
+    trimmed_state["messages"] = state["messages"][-5:]
+    result = geo_agent.invoke(trimmed_state)
     state["insights"].append({"agent": "Geo", "text": result["messages"][-1].content})
+    state["next"] = "synthesis"  # Force to synthesis
+    state["messages"] = result["messages"][-5:]  # Trim after
     return state
 
 def product_node(state: AgentState):
-    result = product_agent.invoke(state)
+    # Trim before sub-agent
+    trimmed_state = state.copy()
+    trimmed_state["messages"] = state["messages"][-5:]
+    result = product_agent.invoke(trimmed_state)
     state["insights"].append({"agent": "Product", "text": result["messages"][-1].content})
+    state["next"] = "synthesis"  # Force to synthesis
+    state["messages"] = result["messages"][-5:]  # Trim after
     return state
 
 def synthesis_node(state: AgentState):
+    if not state["insights"]:
+        state["report"] = "No insights generated—check manager delegation."
+        return state
+    # Trim messages to last 5 for synthesis
+    trimmed_messages = state["messages"][-5:]
     synth_prompt = ChatPromptTemplate.from_template("""
     Synthesize insights from {insights} for the prompt in {messages}.
     Steps:
-    1. Combine (e.g., trends + product → recs).
-    2. Actionable: Bullets/tables.
-    3. Markdown format.
-    Edge: Missing data? Note limitations.
+    1. Extract all exact figures from insights (e.g., revenue for Q1-Q4 across all years, % differences).
+    2. Provide a comprehensive summary covering every insight provided by the sub-agent, ensuring no data is omitted.
+    3. Actionable key findings in bullets with exact figures for all quarters and years (e.g., "Q3 2019: $33.31k (highest in 2019, 15% > Q2)").
+    4. Markdown format with a detailed table for all quarters and years (Q1-Q4 revenue across available years).
+    5. No limitations section—data is complete for all available periods; focus on key findings, table with exact figures, actionable insights.
     Once done, return the report.
     """)
-    formatted_prompt = synth_prompt.format(insights=state["insights"], messages=state["messages"])
+    formatted_insights = json.dumps(state["insights"])
+    formatted_prompt = synth_prompt.format(insights=formatted_insights, messages=trimmed_messages)
     state["report"] = llm.invoke(formatted_prompt).content
     return state
 
-# Graph
+# Graph (subs to synthesis directly—no back-edges)
 workflow = StateGraph(AgentState)
 workflow.add_node("manager", manager_node)
 workflow.add_node("segmentation", segmentation_node)
@@ -82,8 +108,11 @@ workflow.add_conditional_edges(
     lambda s: s["next"],
     {"segmentation": "segmentation", "trends": "trends", "geo": "geo", "product": "product", "synthesis": "synthesis"}
 )
-for sub in ["segmentation", "trends", "geo", "product"]:
-    workflow.add_edge(sub, "manager")
+# Direct to synthesis—no back to manager
+workflow.add_edge("segmentation", "synthesis")
+workflow.add_edge("trends", "synthesis")
+workflow.add_edge("geo", "synthesis")
+workflow.add_edge("product", "synthesis")
 workflow.add_edge("synthesis", END)
 
 app = workflow.compile(checkpointer=MemorySaver())
