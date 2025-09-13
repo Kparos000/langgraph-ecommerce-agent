@@ -2,6 +2,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.prompts import ChatPromptTemplate
 import json
+import re
 from state import AgentState
 from sub_agents import segmentation_agent, trends_agent, geo_agent, product_agent
 from config import get_llm
@@ -18,7 +19,6 @@ Example: For vague, output "next: synthesis".
 """)
 
 def manager_node(state: AgentState):
-    # Trim messages to last 3 to prevent token bloat
     trimmed_messages = state["messages"][-3:]
     formatted_prompt = manager_prompt.format(messages=trimmed_messages)
     response = llm.invoke(formatted_prompt)
@@ -29,54 +29,76 @@ def manager_node(state: AgentState):
         next_agent = "synthesis"
     print(f"Manager delegated to: {next_agent}")  # Debug
     state["next"] = next_agent
-    state["messages"] = trimmed_messages + [response]  # Append response, keep trimmed
+    state["messages"] = trimmed_messages + [response]
     return state
 
-def segmentation_node(state: AgentState):
-    # Trim before sub-agent
+def invoke_sub_agent(agent, state):
+    """Direct invoke sub-agent with higher recursion limit, extract Final Answer JSON."""
     trimmed_state = state.copy()
     trimmed_state["messages"] = state["messages"][-5:]
-    result = segmentation_agent.invoke(trimmed_state)
-    state["insights"].append({"agent": "Segmentation", "text": result["messages"][-1].content})
-    state["next"] = "synthesis"  # Force to synthesis
-    state["messages"] = result["messages"][-5:]  # Trim after
+    try:
+        result = agent.invoke(trimmed_state, config={"recursion_limit": 100})
+        last_content = result["messages"][-1].content
+        # Extract Final Answer JSON
+        final_match = re.search(r'Final Answer[:\s]*(\[.*?\])', last_content, re.DOTALL)
+        if final_match:
+            json_str = final_match.group(1)
+        else:
+            # Fallback to first array or string
+            array_match = re.search(r'\[.*?\]', last_content, re.DOTALL)
+            json_str = array_match.group() if array_match else '[]'
+        parsed = json.loads(json_str)
+        insights_list = parsed if isinstance(parsed, list) else [str(parsed)]
+        print(f"Sub-agent succeeded: {insights_list}")
+        # Update result
+        result["messages"][-1].content = json.dumps({"insights": insights_list})
+        return result, True
+    except (ValueError, Exception) as e:
+        print(f"Sub-agent failed: {str(e)}")
+        fallback_insights = ["Fallback: Unable to generate insights."]
+        fallback_result = {"messages": trimmed_state["messages"] + [{"role": "system", "content": json.dumps({"insights": fallback_insights})}]}
+        return fallback_result, False
+
+def segmentation_node(state: AgentState):
+    result, success = invoke_sub_agent(segmentation_agent, state)
+    if success:
+        parsed = json.loads(result["messages"][-1].content)
+        state["insights"].append({"agent": "Segmentation", "text": json.dumps(parsed["insights"])})
+    state["next"] = "synthesis"
+    state["messages"] = result["messages"][-5:]
     return state
 
 def trends_node(state: AgentState):
-    # Trim before sub-agent
-    trimmed_state = state.copy()
-    trimmed_state["messages"] = state["messages"][-5:]
-    result = trends_agent.invoke(trimmed_state)
-    state["insights"].append({"agent": "Trends", "text": result["messages"][-1].content})
-    state["next"] = "synthesis"  # Force to synthesis
-    state["messages"] = result["messages"][-5:]  # Trim after
+    result, success = invoke_sub_agent(trends_agent, state)
+    if success:
+        parsed = json.loads(result["messages"][-1].content)
+        state["insights"].append({"agent": "Trends", "text": json.dumps(parsed["insights"])})
+    state["next"] = "synthesis"
+    state["messages"] = result["messages"][-5:]
     return state
 
 def geo_node(state: AgentState):
-    # Trim before sub-agent
-    trimmed_state = state.copy()
-    trimmed_state["messages"] = state["messages"][-5:]
-    result = geo_agent.invoke(trimmed_state)
-    state["insights"].append({"agent": "Geo", "text": result["messages"][-1].content})
-    state["next"] = "synthesis"  # Force to synthesis
-    state["messages"] = result["messages"][-5:]  # Trim after
+    result, success = invoke_sub_agent(geo_agent, state)
+    if success:
+        parsed = json.loads(result["messages"][-1].content)
+        state["insights"].append({"agent": "Geo", "text": json.dumps(parsed["insights"])})
+    state["next"] = "synthesis"
+    state["messages"] = result["messages"][-5:]
     return state
 
 def product_node(state: AgentState):
-    # Trim before sub-agent
-    trimmed_state = state.copy()
-    trimmed_state["messages"] = state["messages"][-5:]
-    result = product_agent.invoke(trimmed_state)
-    state["insights"].append({"agent": "Product", "text": result["messages"][-1].content})
-    state["next"] = "synthesis"  # Force to synthesis
-    state["messages"] = result["messages"][-5:]  # Trim after
+    result, success = invoke_sub_agent(product_agent, state)
+    if success:
+        parsed = json.loads(result["messages"][-1].content)
+        state["insights"].append({"agent": "Product", "text": json.dumps(parsed["insights"])})
+    state["next"] = "synthesis"
+    state["messages"] = result["messages"][-5:]
     return state
 
 def synthesis_node(state: AgentState):
     if not state["insights"]:
-        state["report"] = "No insights generated—check manager delegation."
+        state["report"] = "No insights generated—check manager delegation or sub-agent output."
         return state
-    # Trim messages to last 5 for synthesis
     trimmed_messages = state["messages"][-5:]
     synth_prompt = ChatPromptTemplate.from_template("""
     Synthesize insights from {insights} for the prompt in {messages}.
@@ -108,7 +130,6 @@ workflow.add_conditional_edges(
     lambda s: s["next"],
     {"segmentation": "segmentation", "trends": "trends", "geo": "geo", "product": "product", "synthesis": "synthesis"}
 )
-# Direct to synthesis—no back to manager
 workflow.add_edge("segmentation", "synthesis")
 workflow.add_edge("trends", "synthesis")
 workflow.add_edge("geo", "synthesis")

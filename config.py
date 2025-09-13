@@ -7,11 +7,15 @@ from google.cloud import bigquery
 load_dotenv()
 
 def get_llm():
-    """Initialize Gemini 1.5 Flash LLM for SQL gen and synthesis."""
+    """Initialize Gemini 1.5 Flash LLM for SQL gen and synthesis with JSON mode."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY not set in .env - check file and key from AI Studio.")
-    return ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key)
+    return ChatGoogleGenerativeAI(
+        model="gemini-1.5-flash", 
+        google_api_key=api_key,
+        model_kwargs={"generation_config": {"response_mime_type": "application/json"}}
+    )
 
 def get_bq_client():
     """Initialize BigQuery client using service account JSON."""
