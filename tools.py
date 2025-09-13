@@ -1,36 +1,26 @@
 from langchain_core.tools import tool
 from google.cloud import bigquery
 import pandas as pd
-from typing import Dict
+from langgraph.types import Command
+from config import get_bq_client
 
-@tool
-def execute_query(sql: str, client: bigquery.Client) -> str:
-    """Execute SQL on BigQuery and return Markdown table."""
-    try:
-        # Guardrail: Block non-SELECT queries
-        if not sql.strip().upper().startswith("SELECT"):
-            return "Error: Only SELECT queries allowed."
-        # Ensure dataset prefix
-        if "bigquery-public-data.thelook_ecommerce" not in sql:
-            sql = sql.replace("FROM `", "FROM `bigquery-public-data.thelook_ecommerce.")
-        df = client.query(sql).to_dataframe()
-        if df.empty:
-            return "No results returned."
-        return df.head(1000).to_markdown(index=False)  # Per PRD: LIMIT 1000
-    except Exception as e:
-        return f"Query error: {str(e)}"
+def get_execute_query_tool():
+    @tool
+    def wrapped_execute_query(sql: str) -> str:
+        """Execute SQL on BigQuery, return DF Markdown summary."""
+        try:
+            client = get_bq_client()
+            query_job = client.query(sql)
+            df = query_job.to_dataframe()
+            return f"Shape: {df.shape}\n{df.head().to_markdown()}"
+        except Exception as e:
+            return f"Error: {str(e)}"
+    return wrapped_execute_query
 
 def create_handoff_tool(agent_name: str):
-    """Create handoff tool for routing to sub-agent."""
     @tool
-    def handoff(state: Dict) -> Dict:
-        """Route to specified sub-agent."""
-        return {"goto": f"{agent_name}_node", "update": {"messages": state["messages"] + [{"role": "tool", "content": f"Handoff to {agent_name}"}]}}
+    def handoff(state: dict) -> Command:
+        """Hand off the current state to the specified agent for further processing."""
+        return Command(goto=agent_name, update={"messages": state["messages"] + [{"role": "tool", "content": f"Handed off to {agent_name}"}]})
     handoff.__name__ = f"handoff_to_{agent_name}"
     return handoff
-
-# Instantiate handoff tools for each sub-agent
-handoff_segmentation = create_handoff_tool("segmentation")
-handoff_trends = create_handoff_tool("trends")
-handoff_geo = create_handoff_tool("geo")
-handoff_product = create_handoff_tool("product")
