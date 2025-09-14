@@ -18,3 +18,16 @@ Custom AI agent for e-commerce insights on BigQuery `bigquery-public-data.theloo
 
 ## Architecture
 Mermaid diagram (copy to mermaid.live for PNG export as `diagram.png`):
+
+
+**Explanation of Choices**:
+- **LLM**: Gemini 1.5 Flash for fast SQL gen and synthesis.
+- **Data Handling**: BigQuery client with test query on startup; Pandas for df.to_markdown() summaries.
+- **Errors**: LLM retry max 3 (Section 3.2); fallback in invoke_sub_agent.
+- **Flow**: Manager classifies/handoffs (OpenAI Guide Pages 17-19); subs ReAct loop (single tool call); synthesis aggregates.
+
+## Evals
+`pytest tests/` (validates 4 prompts, 80% insight match).
+
+## Flow Summary
+Prompt → Manager (classify) → Sub(s) (SQL → Tool → Insights) → Synthesis (report) → CLI/file. Total calls: 4-6 LLM, 1-2 queries.
