@@ -103,12 +103,24 @@ def synthesis_node(state: AgentState):
     synth_prompt = ChatPromptTemplate.from_template("""
     Synthesize insights from {insights} for the prompt in {messages}.
     Steps:
-    1. Extract all exact figures from insights (e.g., revenue for Q1-Q4 across all years, % differences).
-    2. Provide a comprehensive summary covering every insight provided by the sub-agent, ensuring no data is omitted.
-    3. Actionable key findings in bullets with exact figures for all quarters and years (e.g., "Q3 2019: $33.31k (highest in 2019, 15% > Q2)").
-    4. Markdown format with a detailed table for all quarters and years (Q1-Q4 revenue across available years).
-    5. If insights cover top N results (e.g., top 3 countries), note 'Based on top N results; full total queried separately if needed'.
-    6. No limitations section—data is complete for all available periods; focus on key findings, table with exact figures, actionable insights.
+    1. Extract exact figures from insights, focusing on the scope of the original prompt (e.g., specific year or location if provided).
+    2. Provide a summary relevant to the prompt, covering all insights provided by the sub-agent without assuming data beyond the query.
+    3. Actionable key findings in bullets with exact figures (e.g., "China: $611,205 in 2023").
+    4. Markdown format with a table summarizing the insights (e.g., revenue by country for the queried year).
+    5. If insights cover top N results (e.g., top 3 countries), note 'Based on top N results' and avoid referencing unqueried data (e.g., other years or quarters).
+    6. No limitations section unless data is explicitly missing for the queried scope; focus on key findings, table with exact figures, actionable insights.
+    Example for prompt "What region has the most sales in 2023?":
+    ## Sales Report: Top Regions by Revenue (2023)
+    Based on top 3 results.
+    - China: $611,205 in 2023.
+    - United States: $401,597 in 2023.
+    - Brasil: $248,345 in 2023.
+    | Country | Total Revenue (2023) |
+    |---------|----------------------|
+    | China   | $611,205            |
+    | United States | $401,597      |
+    | Brasil  | $248,345            |
+    Actionable: Focus marketing on China for 2024 growth.
     Once done, return the report.
     """)
     formatted_insights = json.dumps(state["insights"])

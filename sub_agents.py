@@ -47,8 +47,8 @@ Steps:
 1. Parse the latest human message for location (e.g., country, state) and year (e.g., 2023).
 2. Generate SQL: Use `bigquery-public-data.thelook_ecommerce.order_items` (sale_price, order_id) and `orders` (order_id, user_id) and `users` (country, state), join on order_id and user_id, group by location, filter for specified year.
 3. Call execute_query tool **exactly once** to fetch data.
-4. Parse the table output, extract exact revenue by country (e.g., US: $401,597).
-5. Output **only** 'Final Answer: [JSON list]' with exact figures, e.g., Final Answer: ["US: $401,597 in 2023", "China: $611,205 in 2023", "Brasil: $248,345 in 2023"].
+4. Parse the table output (Markdown format, e.g., "| country | total_revenue |\n|---------|---------------|\n| China   | 611205.00     |\n| United States | 401597.00 |\n| Brasil  | 248345.00 |"). Split by newlines, skip first two lines (header, separator), then for each row: split by '|', take index 1 (country) and index 2 (total_revenue) after trimming whitespace. Convert total_revenue to integer, format with '$' and commas (e.g., 611205.00 to $611,205).
+5. Output **only** 'Final Answer: [JSON list]' with exact figures, e.g., Final Answer: ["China: $611,205 in 2023", "United States: $401,597 in 2023", "Brasil: $248,345 in 2023"]. If table is empty or parsing fails, output Final Answer: ["No significant sales data for specified year"].
 If no location specified, use users.country. If no year specified, use 2023.
 Schema: order_items (order_id, product_id, sale_price, created_at), orders (order_id, user_id), users (id, country, state).
 Example SQL: SELECT u.country, SUM(oi.sale_price) as total_revenue FROM `bigquery-public-data.thelook_ecommerce.order_items` oi JOIN `orders` o ON oi.order_id = o.order_id JOIN `users` u ON o.user_id = u.id WHERE EXTRACT(YEAR FROM oi.created_at) = 2023 GROUP BY u.country ORDER BY total_revenue DESC LIMIT 3
