@@ -37,14 +37,14 @@ def invoke_sub_agent(agent, state):
     trimmed_state = state.copy()
     trimmed_state["messages"] = state["messages"][-5:]
     try:
-        result = agent.invoke(trimmed_state, config={"recursion_limit": 100})
+        result = agent.invoke(trimmed_state, config={"recursion_limit": 50})
         last_content = result["messages"][-1].content
         # Extract Final Answer JSON
         final_match = re.search(r'Final Answer[:\s]*(\[.*?\])', last_content, re.DOTALL)
         if final_match:
             json_str = final_match.group(1)
         else:
-            # Fallback to first array or string
+            # Fallback to any JSON array
             array_match = re.search(r'\[.*?\]', last_content, re.DOTALL)
             json_str = array_match.group() if array_match else '[]'
         parsed = json.loads(json_str)
@@ -107,7 +107,8 @@ def synthesis_node(state: AgentState):
     2. Provide a comprehensive summary covering every insight provided by the sub-agent, ensuring no data is omitted.
     3. Actionable key findings in bullets with exact figures for all quarters and years (e.g., "Q3 2019: $33.31k (highest in 2019, 15% > Q2)").
     4. Markdown format with a detailed table for all quarters and years (Q1-Q4 revenue across available years).
-    5. No limitations section—data is complete for all available periods; focus on key findings, table with exact figures, actionable insights.
+    5. If insights cover top N results (e.g., top 3 countries), note 'Based on top N results; full total queried separately if needed'.
+    6. No limitations section—data is complete for all available periods; focus on key findings, table with exact figures, actionable insights.
     Once done, return the report.
     """)
     formatted_insights = json.dumps(state["insights"])
