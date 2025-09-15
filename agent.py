@@ -102,25 +102,12 @@ def synthesis_node(state: AgentState):
     trimmed_messages = state["messages"][-5:]
     synth_prompt = ChatPromptTemplate.from_template("""
     Synthesize insights from {insights} for the prompt in {messages}.
-    Steps:
-    1. Extract exact figures from insights, focusing on the scope of the original prompt (e.g., specific year or location if provided).
-    2. Provide a summary relevant to the prompt, covering all insights provided by the sub-agent without assuming data beyond the query.
-    3. Actionable key findings in bullets with exact figures (e.g., "China: $611,205 in 2023").
-    4. Markdown format with a table summarizing the insights (e.g., revenue by country for the queried year).
-    5. If insights cover top N results (e.g., top 3 countries), note 'Based on top N results' and avoid referencing unqueried data (e.g., other years or quarters).
-    6. No limitations section unless data is explicitly missing for the queried scope; focus on key findings, table with exact figures, actionable insights.
-    Example for prompt "What region has the most sales in 2023?":
-    ## Sales Report: Top Regions by Revenue (2023)
-    Based on top 3 results.
-    - China: $611,205 in 2023.
-    - United States: $401,597 in 2023.
-    - Brasil: $248,345 in 2023.
-    | Country | Total Revenue (2023) |
-    |---------|----------------------|
-    | China   | $611,205            |
-    | United States | $401,597      |
-    | Brasil  | $248,345            |
-    Actionable: Focus marketing on China for 2024 growth.
+    Output in a narrative report style for an executive audience: Use paragraphs with bold figures (e.g., **China: $611,205**), no tables, lists, or bullets. Follow the prompt strictly; do not give recommendations unless explicitly asked. Example for "Which two countries had the lowest sales in 2020?":
+    Lowest Sales Countries in 2020
+    In 2020, our lowest sales regions highlighted areas for potential growth, with distinct patterns in purchasing behavior.
+    Austria: The lowest performer was Austria, generating **$154** in sales, primarily from low-volume urban purchases.
+    Colombia: Colombia followed with **$409.96** in sales, skewed toward seasonal items in coastal areas.
+    Across these regions, sales were concentrated in entry-level products, with limited repeat purchases from urban demographics.
     Once done, return the report.
     """)
     formatted_insights = json.dumps(state["insights"])
