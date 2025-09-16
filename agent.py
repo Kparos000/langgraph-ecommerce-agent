@@ -9,16 +9,13 @@ from config import get_llm
 
 llm = get_llm()
 
-# Manager Prompt (refined with more examples for accurate routing)
+# Manager Prompt (simple classification)
 manager_prompt = ChatPromptTemplate.from_template("""
-You are ManagerAgent. Classify the latest human message in {messages} to select one sub-agent: segmentation (customer behavior/demographics), trends (sales/seasonality), geo (geographic patterns), product (product performance/recommendations), or synthesis (vague or done).
-Output **only** "next: [agent_name]".
-Examples:
-- "customer spend" or "top customer segments" → "next: segmentation"
-- "sales trends" or "quarterly revenue" → "next: trends"
-- "top regions" or "sales by country" → "next: geo"
-- "top product" or "product sold" → "next: product"
-- Vague or unclear → "next: synthesis"
+You are ManagerAgent. Classify the latest human message in {messages}.
+Output **only** "next: [agent_name]" where agent_name is one of: segmentation, trends, geo, product, or synthesis if done.
+Example: For "sales trends", output "next: trends".
+Example: For "customer segmentation", output "next: segmentation".
+Example: For vague, output "next: synthesis".
 """)
 
 def manager_node(state: AgentState):
@@ -38,7 +35,7 @@ def manager_node(state: AgentState):
 def invoke_sub_agent(agent, state):
     """Direct invoke sub-agent with higher recursion limit, extract Final Answer JSON."""
     trimmed_state = state.copy()
-    trimmed_state["messages"] = state["messages"][-5:]
+    trimmed_state["messages"] = state["messages"][-10:]  # Changed: Increased from -5 to -10 for more context retention
     try:
         result = agent.invoke(trimmed_state, config={"recursion_limit": 50})
         last_content = result["messages"][-1].content
@@ -61,6 +58,15 @@ def invoke_sub_agent(agent, state):
         fallback_insights = ["Fallback: Unable to generate insights."]
         fallback_result = {"messages": trimmed_state["messages"] + [{"role": "system", "content": json.dumps({"insights": fallback_insights})}]}
         return fallback_result, False
+
+def summarizer_node(state: AgentState):
+    """New: Optional summarizer for long histories (conditional before synthesis)."""
+    if len(state["messages"]) > 10:
+        summary_prompt = ChatPromptTemplate.from_template("Summarize the last 10 messages and insights for context: {messages} {insights}.")
+        formatted = summary_prompt.format(messages=state["messages"][-10:], insights=json.dumps(state["insights"]))
+        summary = llm.invoke(formatted).content
+        state["messages"].append({"role": "system", "content": f"Context Summary: {summary}"})
+    return state
 
 def segmentation_node(state: AgentState):
     result, success = invoke_sub_agent(segmentation_agent, state)
@@ -125,6 +131,7 @@ workflow.add_node("segmentation", segmentation_node)
 workflow.add_node("trends", trends_node)
 workflow.add_node("geo", geo_node)
 workflow.add_node("product", product_node)
+workflow.add_node("summarizer", summarizer_node)  # New: Optional summarizer for long histories
 workflow.add_node("synthesis", synthesis_node)
 
 workflow.add_edge(START, "manager")
@@ -133,10 +140,27 @@ workflow.add_conditional_edges(
     lambda s: s["next"],
     {"segmentation": "segmentation", "trends": "trends", "geo": "geo", "product": "product", "synthesis": "synthesis"}
 )
-workflow.add_edge("segmentation", "synthesis")
-workflow.add_edge("trends", "synthesis")
-workflow.add_edge("geo", "synthesis")
-workflow.add_edge("product", "synthesis")
+workflow.add_conditional_edges(
+    "segmentation",
+    lambda s: "summarizer" if len(s["messages"]) > 10 else "synthesis",
+    {"summarizer": "summarizer", "synthesis": "synthesis"}
+)
+workflow.add_conditional_edges(
+    "trends",
+    lambda s: "summarizer" if len(s["messages"]) > 10 else "synthesis",
+    {"summarizer": "summarizer", "synthesis": "synthesis"}
+)
+workflow.add_conditional_edges(
+    "geo",
+    lambda s: "summarizer" if len(s["messages"]) > 10 else "synthesis",
+    {"summarizer": "summarizer", "synthesis": "synthesis"}
+)
+workflow.add_conditional_edges(
+    "product",
+    lambda s: "summarizer" if len(s["messages"]) > 10 else "synthesis",
+    {"summarizer": "summarizer", "synthesis": "synthesis"}
+)
+workflow.add_edge("summarizer", "synthesis")
 workflow.add_edge("synthesis", END)
 
 app = workflow.compile(checkpointer=MemorySaver())

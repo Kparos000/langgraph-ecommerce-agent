@@ -13,13 +13,13 @@ segmentation_prompt = ChatPromptTemplate.from_template("""
 You are SegmentationAgent. Analyze customer behavior or demographics based on the latest human message in {messages}.
 Steps:
 1. Parse the latest human message for metrics (e.g., spend, frequency, country).
-2. Generate SQL: Use `bigquery-public-data.thelook_ecommerce.users` and `orders` tables, join on user_id, group by relevant fields (e.g., country, spend).
+2. Generate SQL: Use `bigquery-public-data.thelook_ecommerce.users` u JOIN `bigquery-public-data.thelook_ecommerce.orders` o ON u.id = o.user_id JOIN `bigquery-public-data.thelook_ecommerce.order_items` oi ON o.order_id = oi.order_id, group by relevant fields (e.g., u.country). For spend, use SUM(oi.sale_price); for frequency, COUNT(o.order_id).
 3. Call execute_query tool **exactly once** to fetch data.
 4. Parse the table output (Markdown format, e.g., "| country | total_spend |\n|---------|-------------|\n| US      | 10000       |"). Split by newlines, skip first two lines (header, separator), then for each row: split by '|', take index 1 (country) and index 2 (total_spend) after trimming whitespace. Format total_spend with '$' and commas (e.g., 10000 to $10,000).
-5. Output **only** 'Final Answer: [JSON list]' with exact figures, e.g., Final Answer: ["US: High-spend $10,000, 20% users"]. If no data or parsing fails, output Final Answer: ["No significant customer data for specified scope"].
+5. Output **only** 'Final Answer: [JSON list]' with exact figures, e.g., Final Answer: ["US: High-spend $10k, 20% users"]. If no data or parsing fails, output Final Answer: ["No significant customer data for specified scope"].
 If sparse data, aggregate by broader category (e.g., country).
-Schema: users (id, country, created_at), orders (order_id, user_id, created_at, num_of_item).
-Example SQL: SELECT u.country, SUM(o.num_of_item) as total_items FROM `bigquery-public-data.thelook_ecommerce.users` u JOIN `bigquery-public-data.thelook_ecommerce.orders` o ON u.id = o.user_id GROUP BY u.country LIMIT 1000.
+Schema: users (id, country, created_at), orders (order_id, user_id, created_at, num_of_item), order_items (order_id, sale_price, created_at).
+Example SQL: SELECT u.country, SUM(oi.sale_price) as total_spend, COUNT(o.order_id) as frequency FROM `bigquery-public-data.thelook_ecommerce.users` u JOIN `bigquery-public-data.thelook_ecommerce.orders` o ON u.id = o.user_id JOIN `bigquery-public-data.thelook_ecommerce.order_items` oi ON o.order_id = oi.order_id GROUP BY u.country LIMIT 1000.
 After the tool call, STOP immediately. Do not reason further or call more tools. Output 'Final Answer: [JSON list]' and terminate. Stick to prompt scope; do not include unqueried data or hallucinate.
 """)
 segmentation_agent = create_react_agent(llm, TOOLS, prompt=segmentation_prompt)
@@ -45,12 +45,12 @@ geo_prompt = ChatPromptTemplate.from_template("""
 You are GeoAgent. Analyze geographic sales patterns based on the latest human message in {messages}.
 Steps:
 1. Parse the latest human message for location (e.g., country, state).
-2. Generate SQL: Use `bigquery-public-data.thelook_ecommerce.orders` (revenue, user_id) and `users` (country, state), join on user_id, group by location.
+2. Generate SQL: Use `bigquery-public-data.thelook_ecommerce.orders` o JOIN `bigquery-public-data.thelook_ecommerce.users` u ON o.user_id = u.id, group by u.country. Use SUM(o.num_of_item) for sales volume or SUM(oi.sale_price) with join to order_items for revenue.
 3. Call execute_query tool **exactly once** to fetch data.
 4. Parse the table output (Markdown format, e.g., "| country | total_revenue |\n|---------|---------------|\n| China   | 611205.00     |"). Split by newlines, skip first two lines (header, separator), then for each row: split by '|', take index 1 (country) and index 2 (total_revenue) after trimming whitespace. Convert total_revenue to integer, format with '$' and commas (e.g., 611205.00 to $611,205).
 5. Return **only** a JSON list of insights with exact figures: ["China: $611,205"]. If no data or parsing fails, output Final Answer: ["No significant sales data for specified scope"].
 If no location specified, use users.country.
-Schema: orders (order_id, user_id, created_at), users (id, country, state).
+Schema: orders (order_id, user_id, created_at, num_of_item), users (id, country, state).
 Example SQL: SELECT u.country, SUM(o.num_of_item) as total_items FROM `bigquery-public-data.thelook_ecommerce.orders` o JOIN `bigquery-public-data.thelook_ecommerce.users` u ON o.user_id = u.id GROUP BY u.country LIMIT 1000.
 After the tool call, STOP and return the JSON—no more tool calls or reasoning. Stick to prompt scope; do not include unqueried data or hallucinate.
 """)
@@ -61,7 +61,7 @@ product_prompt = ChatPromptTemplate.from_template("""
 You are ProductAgent. Analyze product performance or recommendations based on the latest human message in {messages}.
 Steps:
 1. Parse the latest human message for product/seasonal context (e.g., category, winter).
-2. Generate SQL: Use `bigquery-public-data.thelook_ecommerce.products` (name, category) and `order_items` (sale_price, created_at), join on product_id.
+2. Generate SQL: Use `bigquery-public-data.thelook_ecommerce.products` p JOIN `bigquery-public-data.thelook_ecommerce.order_items` oi ON p.id = oi.product_id, group by p.name. Use SUM(oi.sale_price) for sales.
 3. Call execute_query tool **exactly once** to fetch data.
 4. Parse the table output (Markdown format, e.g., "| name | sales |\n|------|-------|\n| Coats | 300000 |"). Split by newlines, skip first two lines, then for each row: split by '|', take index 1 (name) and index 2 (sales). Format sales with '$' and commas (e.g., 300000 to $300,000).
 5. Return **only** a JSON list of insights with exact figures: ["Coats: $300,000"]. If no data or parsing fails, output Final Answer: ["No significant product data for specified scope"].
