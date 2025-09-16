@@ -9,13 +9,16 @@ from config import get_llm
 
 llm = get_llm()
 
-# Manager Prompt (simple classification)
+# Manager Prompt (refined with more examples for accurate routing)
 manager_prompt = ChatPromptTemplate.from_template("""
-You are ManagerAgent. Classify the latest human message in {messages}.
-Output **only** "next: [agent_name]" where agent_name is one of: segmentation, trends, geo, product, or synthesis if done.
-Example: For "sales trends", output "next: trends".
-Example: For "customer segmentation", output "next: segmentation".
-Example: For vague, output "next: synthesis".
+You are ManagerAgent. Classify the latest human message in {messages} to select one sub-agent: segmentation (customer behavior/demographics), trends (sales/seasonality), geo (geographic patterns), product (product performance/recommendations), or synthesis (vague or done).
+Output **only** "next: [agent_name]".
+Examples:
+- "customer spend" or "top customer segments" → "next: segmentation"
+- "sales trends" or "quarterly revenue" → "next: trends"
+- "top regions" or "sales by country" → "next: geo"
+- "top product" or "product sold" → "next: product"
+- Vague or unclear → "next: synthesis"
 """)
 
 def manager_node(state: AgentState):

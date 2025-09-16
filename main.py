@@ -48,9 +48,8 @@ def main():
             result = app.invoke(initial_state, config)
             report = result.get("report", "No report generated—check prompt relevance.")
 
-            # Print truncated summary (~500 chars)
-            summary = report[:500] + "..." if len(report) > 500 else report
-            print(f"\nInsights Summary:\n{summary}\nFull report appended to report.md.")
+            # Print full report (no truncation or labels)
+            print(f"\n{report}\nFull report appended to report.md.")
 
             # Append full report to report.md
             with open("report.md", "a", encoding="utf-8") as f:
