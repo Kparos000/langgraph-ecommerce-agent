@@ -8,5 +8,6 @@ class AgentState(TypedDict):
     df: pd.DataFrame  # Query results
     insights: List[dict]  # e.g., [{"agent": "Trends", "text": "Q3 peak"}]
     next: str  # Router key (e.g., "trends")
-    phase: str  # New: "delegate" or "done" to control loop
+    phase: str  # "delegate" or "done" to control loop
     report: str  # Final Markdown
+    errors: List[dict]  # [{"type": "fallback", "agent": "Trends", "error": "str(e)", "retries": 3}] – Track for evals/synthesis

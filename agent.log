@@ -1,0 +1,48 @@
+2025-09-17 15:53:03,672 - INFO - User prompt: What were the sales trends by quarter in 2023?
+2025-09-17 15:53:21,461 - INFO - Manager delegated to: trends
+2025-09-17 15:56:50,640 - INFO - Sub-agent succeeded: []
+2025-09-17 15:56:52,396 - INFO - Report generated successfully for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:03:34,148 - INFO - User prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:03:34,973 - INFO - Manager delegated to: trends
+2025-09-17 16:05:24,374 - INFO - Sub-agent succeeded: []
+2025-09-17 16:05:28,645 - INFO - Report generated successfully for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:19:29,689 - INFO - User prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:19:30,889 - INFO - Manager delegated to: trends
+2025-09-17 16:21:18,833 - INFO - Sub-agent succeeded: []
+2025-09-17 16:21:21,828 - INFO - Report generated successfully for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:30:07,776 - INFO - User prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:30:08,315 - INFO - Manager delegated to: trends
+2025-09-17 16:31:55,142 - INFO - Sub-agent succeeded: []
+2025-09-17 16:31:58,429 - INFO - Report generated successfully for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:35:24,398 - INFO - User prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:35:25,333 - INFO - Manager delegated to: trends
+2025-09-17 16:37:13,015 - INFO - Sub-agent succeeded: []
+2025-09-17 16:37:16,206 - INFO - Report generated successfully for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:41:27,570 - INFO - User prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:41:28,298 - INFO - Manager delegated to: trends
+2025-09-17 16:43:11,031 - INFO - Sub-agent succeeded: []
+2025-09-17 16:43:15,212 - INFO - Report generated successfully for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:50:53,834 - INFO - User prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:50:55,524 - INFO - Manager delegated to: trends
+2025-09-17 16:52:41,480 - INFO - Sub-agent succeeded: []
+2025-09-17 16:52:47,357 - INFO - Report generated successfully for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:56:11,034 - INFO - User prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:56:11,478 - INFO - Manager delegated to: trends
+2025-09-17 16:56:11,481 - ERROR - Sub-agent failed: '"insights"'
+2025-09-17 16:56:11,487 - INFO - Latency: 0.45s for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:56:11,489 - INFO - Report generated successfully for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:58:34,710 - INFO - User prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:58:35,095 - INFO - Manager delegated to: trends
+2025-09-17 16:58:35,099 - ERROR - Sub-agent failed: '"insights"'
+2025-09-17 16:58:36,891 - INFO - Latency: 2.18s for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 16:58:36,894 - INFO - Report generated successfully for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 17:06:13,045 - INFO - User prompt: What were the sales trends by quarter in 2023?
+2025-09-17 17:06:13,475 - INFO - Manager delegated to: trends
+2025-09-17 17:06:13,478 - ERROR - Sub-agent failed: '"insights"'
+2025-09-17 17:06:14,422 - INFO - Latency: 1.38s for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 17:06:14,424 - INFO - Report generated successfully for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 17:17:14,983 - INFO - User prompt: What were the sales trends by quarter in 2023?
+2025-09-17 17:17:15,462 - INFO - Manager delegated to: trends
+2025-09-17 17:17:15,466 - ERROR - Sub-agent failed: '"insights"'
+2025-09-17 17:17:16,404 - INFO - Latency: 1.42s for prompt: What were the sales trends by quarter in 2023?
+2025-09-17 17:17:16,406 - INFO - Report generated successfully for prompt: What were the sales trends by quarter in 2023?
