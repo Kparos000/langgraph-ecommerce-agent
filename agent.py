@@ -1,7 +1,7 @@
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage  # For consistent handling
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 import json
 import re
 from state import AgentState
@@ -10,7 +10,7 @@ from config import get_llm
 
 llm = get_llm()
 
-# Fixed: Proper messages template for manager (Handbook Ch. 4: Use from_messages for chat history; avoids str() mismatch in JSON mode)
+# Fixed: Proper messages template for manager
 manager_system = """You are ManagerAgent. First, check if the latest human message is relevant to e-commerce analysis (customer segmentation, sales trends, geo patterns, product performance). If off-topic, output "next: off_topic" and explain briefly. Otherwise, classify.
 
 Classify the latest human message.
@@ -20,22 +20,21 @@ Example: For "customer segmentation", output "next: segmentation".
 Example: For vague, output "next: synthesis"."""
 manager_prompt = ChatPromptTemplate.from_messages([
     ("system", manager_system),
-    ("human", "{latest_message}"),  # Extract last for simplicity; full history via state if needed
+    ("human", "{latest_message}"),
 ])
-manager_chain = manager_prompt | llm  # Chain serializes correctly (Guide p. 9: Robust for decisions)
+manager_chain = manager_prompt | llm
 
 def manager_node(state: AgentState):
     if not state["messages"]:
         state["next"] = "synthesis"
         return state
-    latest_message = state["messages"][-1]  # Last is HumanMessage
+    latest_message = state["messages"][-1]
     try:
         response = manager_chain.invoke({"latest_message": latest_message.content})
     except Exception as e:
-        print(f"Manager chain error: {e}")  # Debug isolation
-        response = AIMessage(content="next: synthesis")  # Fallback (PRD: Graceful degradation)
+        print(f"Manager chain error: {e}")
+        response = AIMessage(content="next: synthesis")
     final_content = response.content.strip()
-    # Handle off-topic (Guide p. 24: Halt/transfer)
     if "next: off_topic" in final_content:
         state["next"] = "synthesis"
         state["insights"].append({"agent": "Manager", "text": "Off-topic prompt: Focus on e-commerce analysis."})
@@ -46,37 +45,42 @@ def manager_node(state: AgentState):
         next_agent = final_content.split("next: ")[1].strip()
     else:
         next_agent = "synthesis"
-    print(f"Manager delegated to: {next_agent}")  # Debug
+    print(f"Manager delegated to: {next_agent}")
     state["next"] = next_agent
     state["messages"] += [response]
     return state
 
-# Fixed: Reflection chain as messages template (prevents same str() issue in retries)
+# Fixed: Reflection chain
 reflect_system = "You are a reflective agent. Error in previous step: {error}. Suggest fix for the task."
 reflect_prompt = ChatPromptTemplate.from_messages([
     ("system", reflect_system),
-    ("human", "{task_content}"),  # Task from last message
+    ("human", "{task_content}"),
 ])
 reflect_chain = reflect_prompt | llm
 
 def invoke_sub_agent(agent, state, max_retries=3):
-    """Direct invoke sub-agent with higher recursion limit, extract Final Answer JSON."""
     trimmed_state = state.copy()
     trimmed_state["messages"] = state["messages"][-10:]
-    # Ensure BaseMessage (non-breaking)
-    trimmed_state["messages"] = [msg if isinstance(msg, BaseMessage) else HumanMessage(content=str(msg)) if msg[0] == "human" else AIMessage(content=str(msg[1])) for msg in trimmed_state["messages"]]
+    trimmed_state["messages"] = [msg if isinstance(msg, BaseMessage) else HumanMessage(content=str(msg)) if hasattr(msg, '0') and msg[0] == "human" else AIMessage(content=str(msg)) for msg in trimmed_state["messages"]]
     for retry in range(max_retries):
         try:
             result = agent.invoke(trimmed_state, config={"recursion_limit": 50})
             last_content = result["messages"][-1].content
-            # Extract Final Answer JSON
+            # Robust extraction: Try Final Answer, then any JSON array, then parse whole as JSON (Handbook Ch. 4: Multi-fallback for parse)
             final_match = re.search(r'Final Answer[:\s]*(\[.*?\])', last_content, re.DOTALL)
             if final_match:
                 json_str = final_match.group(1)
             else:
                 array_match = re.search(r'\[.*?\]', last_content, re.DOTALL)
-                json_str = array_match.group() if array_match else '[]'
-            parsed = json.loads(json_str)
+                json_str = array_match.group() if array_match else None
+                if not json_str:
+                    # Fallback: Try full JSON parse (e.g., {"insights": [...]})
+                    try:
+                        parsed_full = json.loads(last_content)
+                        json_str = json.dumps(parsed_full.get("insights", []))
+                    except:
+                        json_str = '[]'
+            parsed = json.loads(json_str) if json_str else []
             insights_list = parsed if isinstance(parsed, list) else [str(parsed)]
             print(f"Sub-agent succeeded: {insights_list}")
             result["messages"][-1] = AIMessage(content=json.dumps({"insights": insights_list}))
@@ -86,7 +90,6 @@ def invoke_sub_agent(agent, state, max_retries=3):
         except (ValueError, Exception) as e:
             print(f"Sub-agent failed (retry {retry+1}): {str(e)}")
             if retry < max_retries - 1:
-                # Fixed: Use chain for reflection (Handbook Ch. 4: Adaptation via structured prompts)
                 task_content = trimmed_state["messages"][-1].content
                 try:
                     reflection = reflect_chain.invoke({"error": str(e), "task_content": task_content})
@@ -137,11 +140,11 @@ def product_node(state: AgentState):
     state["messages"] = result["messages"][-5:]
     return state
 
-# Fixed: Summary chain as messages (same serialization fix)
+# Fixed: Summary chain
 summary_system = "Summarize the last 10 messages and insights for context."
 summary_prompt = ChatPromptTemplate.from_messages([
     ("system", summary_system),
-    ("human", "{context}"),  # Combined messages/insights
+    ("human", "{context}"),
 ])
 summary_chain = summary_prompt | llm
 
@@ -177,7 +180,7 @@ def synthesis_node(state: AgentState):
     state["report"] = llm.invoke(formatted_prompt).content
     return state
 
-# Graph unchanged
+# Graph
 workflow = StateGraph(AgentState)
 workflow.add_node("manager", manager_node)
 workflow.add_node("segmentation", segmentation_node)

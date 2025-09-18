@@ -7,14 +7,14 @@ from google.cloud import bigquery
 load_dotenv()
 
 def get_llm():
-    """Initialize Gemini 1.5 Flash LLM for SQL gen and synthesis with JSON mode."""
+    """Initialize Gemini 1.5 Flash LLM for SQL gen and synthesis (text mode for React; enforce JSON via prompts - Handbook Ch. 4)."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY not set in .env - check file and key from AI Studio.")
     return ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash", 
-        google_api_key=api_key,
-        model_kwargs={"generation_config": {"response_mime_type": "application/json"}}
+        model="gemini-1.5-flash",
+        google_api_key=api_key
+        # Removed: response_mime_type="application/json" (conflicts with React text prompts; Guide p. 9: Align config with instructions)
     )
 
 def get_bq_client():
@@ -30,9 +30,7 @@ if __name__ == "__main__":
         client = get_bq_client()
         dataset = "bigquery-public-data.thelook_ecommerce"
         tables = ["orders", "order_items", "products", "users"]
-
         print("BigQuery auth success! Fetching dataset metadata...\n")
-
         for table in tables:
             table_ref = f"{dataset}.{table}"
             # Get table metadata
@@ -57,7 +55,6 @@ if __name__ == "__main__":
                 result = client.query(query).result()
                 min_date, max_date = next(result)
                 date_range = f"{min_date} to {max_date}"
-
             # Print formatted metadata
             print(f"Table: {table}")
             print(f"Row Count: {row_count}")
@@ -66,7 +63,6 @@ if __name__ == "__main__":
             for field_name, field_type in schema:
                 print(f"  - {field_name}: {field_type}")
             print()
-
         print("Dataset metadata retrieved successfully.")
     except Exception as e:
         print(f"Metadata retrieval error: {e}")
