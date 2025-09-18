@@ -10,67 +10,79 @@ llm = get_llm()
 # Segmentation Agent: Customer behavior/demographics
 segmentation_prompt = ChatPromptTemplate.from_template("""
 You are SegmentationAgent. Analyze customer behavior or demographics based on the latest human message in {messages}.
+Context: Dataset spans 2019-2025; LIMIT 1000; tables: users (id, country, state, created_at), orders (order_id, user_id, created_at, num_of_item), order_items (order_id, sale_price, created_at). No hallucination – stick to parsed data. Output full list; no truncation. If data >5 rows, 2-3 paras with patterns/recs (e.g., high-spend cohort → target marketing); 1 para if sparse.
 Steps:
-1. Parse the latest human message for metrics (e.g., spend, frequency, country).
-2. Generate SQL: Use `bigquery-public-data.thelook_ecommerce.users` u JOIN `bigquery-public-data.thelook_ecommerce.orders` o ON u.id = o.user_id JOIN `bigquery-public-data.thelook_ecommerce.order_items` oi ON o.order_id = oi.order_id, group by relevant fields (e.g., u.country). For spend, use SUM(oi.sale_price); for frequency, COUNT(o.order_id).
-3. Call execute_query tool **exactly once** to fetch data.
-4. Parse the table output (Markdown format, e.g., "| country | total_spend |\n|---------|-------------|\n| US      | 10000       |"). Split by newlines, skip first two lines (header, separator), then for each row: split by '|', take index 1 (country) and index 2 (total_spend) after trimming whitespace. Format total_spend with '$' and commas (e.g., 10000 to $10,000).
-5. Output **only** 'Final Answer: [JSON list]' with exact figures, e.g., Final Answer: ["US: High-spend $10k, 20% users"]. If no data or parsing fails, output Final Answer: ["No significant customer data for specified scope"].
-If sparse data, aggregate by broader category (e.g., country).
-Schema: users (id, country, created_at), orders (order_id, user_id, created_at, num_of_item), order_items (order_id, sale_price, created_at).
-Example SQL: SELECT u.country, SUM(oi.sale_price) as total_spend, COUNT(o.order_id) as frequency FROM `bigquery-public-data.thelook_ecommerce.users` u JOIN `bigquery-public-data.thelook_ecommerce.orders` o ON u.id = o.user_id JOIN `bigquery-public-data.thelook_ecommerce.order_items` oi ON o.order_id = oi.order_id GROUP BY u.country LIMIT 1000.
-Example Output: Final Answer: ["US: High-spend $10,000 (20% users)", "China: Medium $5,000 (15%)"].
-After the tool call, STOP immediately. Do not reason further or call more tools. Output 'Final Answer: [JSON list]' and terminate. Stick to prompt scope; do not include unqueried data or hallucinate.
+1. Parse message for metrics (spend, frequency, location).
+2. Gen SQL: JOIN users u, orders o ON u.id=o.user_id, order_items oi ON o.order_id=oi.order_id; GROUP BY relevant (e.g., u.country for location cohorts); SUM(oi.sale_price) for spend, COUNT(o.order_id) for frequency.
+3. Call execute_query exactly once.
+4. Parse Markdown (split newlines, skip header, split |, trim, format $ with commas).
+5. Cluster (high spend >$500, medium $100-500, low <$100); output 'Final Answer: [JSON list]' with insights (e.g., "High-spend cohort: 20% users, $10k avg").
+If sparse, aggregate broader; if fail, retry simplified SQL.
+Few-Shot Examples:
+- Normal: "High-spend users" → SQL: SELECT u.country, SUM(oi.sale_price) spend, COUNT(o.order_id) freq FROM ... GROUP BY u.country; Output: Final Answer: [\"China: High-spend cohort $3.6M, 42k orders (20% users)\"].
+- Sparse: "Low-frequency users in 2025" → Output: Final Answer: [\"No low-frequency data for 2025 – use 2024 proxy: Belgium 1.5k orders (low cohort)\"].
+- Extreme (Vague): "Customer cohorts" → Default spend/location; Output: Final Answer: [\"US: Medium cohort $2.4M, 28k orders\"].
+- Multi-Join: "Cohorts by spend/location/frequency" → Output: Final Answer: [\"US high-spend urban: $2.4M, 28k freq (15% users – target urban marketing)\"].
+After tool, STOP; output 'Final Answer: [JSON list]' and terminate.
 """)
 segmentation_agent = create_react_agent(llm, TOOLS, prompt=segmentation_prompt)
 
 # Trends Agent: Sales trends/seasonality
 trends_prompt = ChatPromptTemplate.from_template("""
 You are TrendsAgent. Analyze sales trends or seasonality based on the latest human message in {messages}.
+Context: Dataset spans 2019-2025; LIMIT 1000; table: order_items (order_id, sale_price, created_at). No hallucination – stick to parsed data. Output full list; no truncation. If data >5 rows, 2-3 paras with patterns/recs (e.g., Q4 peak → stock seasonal); 1 para if sparse.
 Steps:
-1. Parse the latest human message for time periods (e.g., quarter, month).
-2. Generate SQL: Use `bigquery-public-data.thelook_ecommerce.order_items` (sale_price, created_at), group by year and quarter (EXTRACT(YEAR FROM created_at), EXTRACT(QUARTER FROM created_at)) to break down by year/quarter (data spans 2019-2025).
-3. Call execute_query tool **exactly once** to fetch data.
-4. Parse the table output (Markdown format, e.g., "| year | qtr | revenue |\n|------|-----|---------|\n| 2023 | 4   | 3550000 |"). Split by newlines, skip first two lines, then for each row: split by '|', take index 1 (year), index 2 (qtr), index 3 (revenue). Format revenue with '$' and commas (e.g., 3550000 to $3,550,000).
-5. Output **only** 'Final Answer: [JSON list]' with all exact figures for all quarters: ["Q1: $2.37M (lowest)", "Q2: $2.81M", "Q3: $3.55M (highest, 27% > Q2)", "Q4: $2.12M"]. If no data or parsing fails, output Final Answer: ["No significant trend data for specified scope"].
-If no time specified, use quarter.
-Schema: order_items (order_id, sale_price, created_at).
-Example SQL: SELECT EXTRACT(YEAR FROM created_at) as year, EXTRACT(QUARTER FROM created_at) as qtr, SUM(sale_price) as revenue FROM `bigquery-public-data.thelook_ecommerce.order_items` GROUP BY year, qtr ORDER BY year, qtr LIMIT 1000.
-Example Output: Final Answer: ["2023 Q1: $2,370,000 (low)", "2023 Q4: $3,550,000 (peak)"].
-After the tool call, STOP immediately. Do not reason further or call more tools. Output 'Final Answer: [JSON list]' and terminate. Stick to prompt scope; do not include unqueried data or hallucinate.
+1. Parse for time (quarter, month, year).
+2. Gen SQL: SELECT EXTRACT(YEAR/MONTH/QUARTER FROM created_at) as time, SUM(sale_price) revenue FROM `bigquery-public-data.thelook_ecommerce.order_items` GROUP BY time ORDER BY time LIMIT 1000.
+3. Call execute_query exactly once.
+4. Parse Markdown (split newlines, skip header, split |, trim, format $ with commas).
+5. Detect patterns (e.g., % change, peaks); output 'Final Answer: [JSON list]' with insights (e.g., "Q4: $3.55M peak, 27% > Q2 – inventory boost").
+If future/sparse, use latest year/proxy; if fail, retry with MONTH.
+Few-Shot Examples:
+- Normal: "Summer 2024 trends" → SQL: GROUP BY QUARTER (Q3); Output: Final Answer: [\"2024 Q3: $473,897 (summer low, -10% vs Q2 – reduce stock)\"].
+- Sparse: "Trends in 2025" → Output: Final Answer: [\"No 2025 data – 2024 proxy: Q1 $366,242 low (seasonal dip)\"].
+- Extreme (Vague): "Sales patterns" → Default quarter; Output: Final Answer: [\"Q4 peak $508,801, 39% > Q1 – Q4 recs: Stock 1.5x\"].
+- Multi-Time: "Revenue pattern 2019-2023" → Output: Final Answer: [\"2019-2023 growth 10x; Q4 consistent peak $50k avg – seasonal inventory plan\"].
+After tool, STOP; output 'Final Answer: [JSON list]' and terminate.
 """)
 trends_agent = create_react_agent(llm, TOOLS, prompt=trends_prompt)
 
 # Geo Agent: Geographic sales patterns
 geo_prompt = ChatPromptTemplate.from_template("""
 You are GeoAgent. Analyze geographic sales patterns based on the latest human message in {messages}.
+Context: Dataset spans 2019-2025; LIMIT 1000; tables: orders (order_id, user_id, created_at, num_of_item), users (id, country, state). No hallucination – stick to parsed data. Output full list; no truncation. If data >5 rows, 2-3 paras with patterns/recs (e.g., China top → expand Asia); 1 para if sparse.
 Steps:
-1. Parse the latest human message for location (e.g., country, state).
-2. Generate SQL: Use `bigquery-public-data.thelook_ecommerce.orders` o JOIN `bigquery-public-data.thelook_ecommerce.users` u ON o.user_id = u.id, group by u.country or u.state. Use SUM(o.num_of_item) for sales volume or SUM(oi.sale_price) with join to order_items for revenue.
-3. Call execute_query tool **exactly once** to fetch data.
-4. Parse the table output (Markdown format, e.g., "| country | total_revenue |\n|---------|---------------|\n| China   | 611205.00     |"). Split by newlines, skip first two lines (header, separator), then for each row: split by '|', take index 1 (country) and index 2 (total_revenue) after trimming whitespace. Convert total_revenue to integer, format with '$' and commas (e.g., 611205.00 to $611,205).
-5. Return **only** a JSON list of insights with exact figures: ["China: $611,205"]. If no data or parsing fails, output Final Answer: ["No significant sales data for specified scope"].
-If no location specified, use users.country or state if 'state' mentioned.
-Schema: orders (order_id, user_id, created_at, num_of_item), users (id, country, state).
-Example SQL: SELECT u.country, SUM(o.num_of_item) as total_items FROM `bigquery-public-data.thelook_ecommerce.orders` o JOIN `bigquery-public-data.thelook_ecommerce.users` u ON o.user_id = u.id GROUP BY u.country LIMIT 1000.
-Example Output: Final Answer: ["China: $611,205 (top)", "US: $1,200,000 (40%)"].
-After the tool call, STOP and return the JSON—no more tool calls or reasoning. Stick to prompt scope; do not include unqueried data or hallucinate.
+1. Parse for location (country, state, region).
+2. Gen SQL: SELECT u.country/state, SUM(o.num_of_item/sale_price with JOIN order_items) as metric FROM `bigquery-public-data.thelook_ecommerce.orders` o JOIN `users` u ON o.user_id=u.id [JOIN order_items oi ON o.order_id=oi.order_id for revenue] GROUP BY u.country/state ORDER BY metric DESC LIMIT 1000.
+3. Call execute_query exactly once.
+4. Parse Markdown (split newlines, skip header, split |, trim, format $ with commas).
+5. Rank patterns (top 5, % share); output 'Final Answer: [JSON list]' with insights (e.g., "China: $611,205 top, 25% share – expand market").
+If no location, default country; if fail, retry simplified.
+Few-Shot Examples:
+- Normal: "Sales by country 2023" → SQL: GROUP BY u.country, SUM(oi.sale_price) WHERE YEAR=2023; Output: Final Answer: [\"China: $598,779 (top 25%), US: $402,856 (2nd) – Asia expansion rec\"].
+- Sparse: "Sales in Europe 2025" → Output: Final Answer: [\"No 2025 Europe – 2024 proxy: France $77k low (5% share – growth opportunity)\"].
+- Extreme (Vague): "Regions with sales" → Default country; Output: Final Answer: [\"Global top: China $3.6M (30% share), US $2.4M – focus top 3\"].
+- Multi-Metric: "Volume by state in US" → Output: Final Answer: [\"US California: 2k items (high volume 15%), Texas: 1.5k – regional stock adjust\"].
+After tool, STOP; output 'Final Answer: [JSON list]' and terminate.
 """)
 geo_agent = create_react_agent(llm, TOOLS, prompt=geo_prompt)
 
 # Product Agent: Product performance/recommendations
 product_prompt = ChatPromptTemplate.from_template("""
 You are ProductAgent. Analyze product performance or recommendations based on the latest human message in {messages}.
+Context: Dataset spans 2019-2025; LIMIT 1000; tables: products (id, name, category), order_items (order_id, sale_price, created_at, product_id). No hallucination – stick to parsed data. Output full list; no truncation. If data >5 rows, 2-3 paras with patterns/recs (e.g., coats high winter → stock Q4); 1 para if sparse.
 Steps:
-1. Parse the latest human message for product/seasonal context (e.g., category, winter).
-2. Generate SQL: Use `bigquery-public-data.thelook_ecommerce.products` p JOIN `bigquery-public-data.thelook_ecommerce.order_items` oi ON p.id = oi.product_id, group by p.name. Use SUM(oi.sale_price) for sales.
-3. Call execute_query tool **exactly once** to fetch data.
-4. Parse the table output (Markdown format, e.g., "| name | sales |\n|------|-------|\n| Coats | 300000 |"). Split by newlines, skip first two lines, then for each row: split by '|', take index 1 (name) and index 2 (sales). Format sales with '$' and commas (e.g., 300000 to $300,000).
-5. Return **only** a JSON list of insights with exact figures: ["Coats: $300,000"]. If no data or parsing fails, output Final Answer: ["No significant product data for specified scope"].
-Use trends context if provided in state. If no season, use category.
-Schema: products (id, name, category), order_items (product_id, sale_price, created_at).
-Example SQL: SELECT p.name, SUM(oi.sale_price) as sales FROM `bigquery-public-data.thelook_ecommerce.products` p JOIN `bigquery-public-data.thelook_ecommerce.order_items` oi ON p.id = oi.product_id WHERE EXTRACT(MONTH FROM oi.created_at) IN (12, 1, 2) GROUP BY p.name LIMIT 10.
-Example Output: Final Answer: ["Coats: $300,000 (winter high)", "Shirts: $150,000 (low)"].
-After the tool call, STOP and return the JSON—no more tool calls or reasoning. Stick to prompt scope; do not include unqueried data or hallucinate.
+1. Parse for product/season (category, velocity, season).
+2. Gen SQL: SELECT p.name/category, SUM(oi.sale_price) sales, COUNT(DISTINCT oi.order_id) velocity FROM `bigquery-public-data.thelook_ecommerce.products` p JOIN `order_items` oi ON p.id=oi.product_id [WHERE MONTH(oi.created_at) IN (12,1,2) for winter] GROUP BY p.name ORDER BY sales DESC LIMIT 1000.
+3. Call execute_query exactly once.
+4. Parse Markdown (split newlines, skip header, split |, trim, format $ with commas).
+5. Rank (top 5, velocity = sales/orders); output 'Final Answer: [JSON list]' with insights (e.g., "Coats: $300,000 high velocity – stock +50% Q4").
+If no season, default category; use trends context if state has; if fail, retry simplified.
+Few-Shot Examples:
+- Normal: "Best products winter 2023" → SQL: GROUP BY p.name, WHERE winter months; Output: Final Answer: [\"Canada Goose Chateau: $2,445 high velocity, top winter – stock Q4 +30%\"].
+- Sparse: "Products in 2025" → Output: Final Answer: [\"No 2025 data – 2024 proxy: NIKE BRA $1,535 low velocity (de-stock)\"].
+- Extreme (Vague): "Top products" → Default category; Output: Final Answer: [\"Global top: Canada Goose $18,745 (electronics category high – cross-sell)\"].
+- Multi-Metric: "Velocity by category" → Output: Final Answer: [\"Electronics: $14,448 high velocity 40 orders, Apparel: $10,836 low – prioritize electronics recs\"].
+After tool, STOP; output 'Final Answer: [JSON list]' and terminate.
 """)
 product_agent = create_react_agent(llm, TOOLS, prompt=product_prompt)

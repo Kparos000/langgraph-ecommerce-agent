@@ -10,14 +10,15 @@ from config import get_llm
 
 llm = get_llm()
 
-# Fixed: Proper messages template for manager
-manager_system = """You are ManagerAgent. First, check if the latest human message is relevant to e-commerce analysis (customer segmentation, sales trends, geo patterns, product performance). If off-topic, output "next: off_topic" and explain briefly. Otherwise, classify.
-
-Classify the latest human message.
-Output **only** "next: [agent_name]" where agent_name is one of: segmentation, trends, geo, product, or synthesis if done.
-Example: For "sales trends", output "next: trends".
-Example: For "customer segmentation", output "next: segmentation".
-Example: For vague, output "next: synthesis"."""
+# Improved Manager: Add few-shot for multi-handoff, ambiguity resolution (e.g., "sales" → revenue), clarification for vague
+manager_system = """You are ManagerAgent. Classify latest human message for e-commerce analysis (customer segmentation/behavior, sales trends/seasonality, geo patterns, product performance/recs). 'Sales' = revenue ($). If off-topic, output 'next: off_topic' and explain. If vague/ambiguous, ask clarification via message (e.g., 'Revenue or items?'). Otherwise, classify and handoff to 1-4 subs (sequence if multi, e.g., trends first for context).
+Output **only** 'next: [agent_name]' or handoff tools; e.g., 'next: trends' or 'Call TrendsAgent then ProductAgent'.
+Examples:
+- Normal: "Sales trends summer 2024" → next: trends.
+- Sparse: "Low sales 2025" → next: trends (future – proxy latest).
+- Extreme (Vague): "Sales?" → Clarify: "Revenue or items? Then next: geo".
+- Multi: "Winter product recs by country" → Call TrendsAgent (seasonal) then ProductAgent then GeoAgent.
+Context: Dataset 2019-2025; LIMIT 1000; no hallucination."""
 manager_prompt = ChatPromptTemplate.from_messages([
     ("system", manager_system),
     ("human", "{latest_message}"),
@@ -50,8 +51,8 @@ def manager_node(state: AgentState):
     state["messages"] += [response]
     return state
 
-# Fixed: Reflection chain
-reflect_system = "You are a reflective agent. Error in previous step: {error}. Suggest fix for the task."
+# Improved Reflection: Add context for ambiguity (e.g., "sales" = revenue)
+reflect_system = "You are reflective. Error: {error}. Suggest fix for task in {task_content}. If ambiguous (e.g., 'sales' = revenue $), clarify metric. Output corrected action or 'retry'."
 reflect_prompt = ChatPromptTemplate.from_messages([
     ("system", reflect_system),
     ("human", "{task_content}"),
@@ -61,12 +62,12 @@ reflect_chain = reflect_prompt | llm
 def invoke_sub_agent(agent, state, max_retries=3):
     trimmed_state = state.copy()
     trimmed_state["messages"] = state["messages"][-10:]
-    trimmed_state["messages"] = [msg if isinstance(msg, BaseMessage) else HumanMessage(content=str(msg)) if hasattr(msg, '0') and msg[0] == "human" else AIMessage(content=str(msg)) for msg in trimmed_state["messages"]]
+    trimmed_state["messages"] = [msg if isinstance(msg, BaseMessage) else HumanMessage(content=str(msg)) if msg[0] == "human" else AIMessage(content=str(msg)) for msg in trimmed_state["messages"]]
     for retry in range(max_retries):
         try:
             result = agent.invoke(trimmed_state, config={"recursion_limit": 50})
             last_content = result["messages"][-1].content
-            # Robust extraction: Try Final Answer, then any JSON array, then parse whole as JSON (Handbook Ch. 4: Multi-fallback for parse)
+            # Robust extraction
             final_match = re.search(r'Final Answer[:\s]*(\[.*?\])', last_content, re.DOTALL)
             if final_match:
                 json_str = final_match.group(1)
@@ -74,7 +75,6 @@ def invoke_sub_agent(agent, state, max_retries=3):
                 array_match = re.search(r'\[.*?\]', last_content, re.DOTALL)
                 json_str = array_match.group() if array_match else None
                 if not json_str:
-                    # Fallback: Try full JSON parse (e.g., {"insights": [...]})
                     try:
                         parsed_full = json.loads(last_content)
                         json_str = json.dumps(parsed_full.get("insights", []))
@@ -140,8 +140,8 @@ def product_node(state: AgentState):
     state["messages"] = result["messages"][-5:]
     return state
 
-# Fixed: Summary chain
-summary_system = "Summarize the last 10 messages and insights for context."
+# Improved Summary: Add context for long histories, few-shot for summary
+summary_system = "Summarize last 10 messages and insights for context. If >5 insights, 2-3 paras with key patterns; 1 para if sparse. No hallucination."
 summary_prompt = ChatPromptTemplate.from_messages([
     ("system", summary_system),
     ("human", "{context}"),
@@ -158,22 +158,24 @@ def summarizer_node(state: AgentState):
         state["messages"] += [summary]
     return state
 
+# Improved Synthesis: Add few-shot for ambiguity ("sales" = revenue), recs inference, 2-3 paras if >5 insights
+synth_prompt = ChatPromptTemplate.from_template("""
+You are SynthesisAgent. Synthesize insights from {insights} for {messages}. 'Sales' = revenue ($). If errors ({errors}), note limitations (e.g., 'Volume vs revenue ambiguity – retry with $').
+Output narrative report for executive: Bold figures (**China: $611,205**), no tables/lists unless asked. If data >5 rows, 2-3 paras with patterns/recs (e.g., Q4 peak → stock boost; infer from patterns even if not asked); 1 para if sparse; no hallucination/filler – stick to parsed data.
+Examples:
+- Normal: Insights ['China $598k top'] → "China led 2023 sales at **$598,779** (25% share). US followed **$402,856** (growth opportunity in Asia)."
+- Sparse: Insights ['No 2025 data'] → "No 2025 sales – proxy 2024: Q4 **$508k** low (adjust inventory)."
+- Extreme (Ambiguous): Insights ['China 10k items'] → "Note: Items volume; revenue proxy **$598k** for China (top – expand)."
+- Multi: Insights ['Q4 peak $508k', 'Coats $300k'] → 3 paras: "Q4 revenue peaked **$508,801** (39% > Q1 – seasonal boost). Coats drove **$300,000** (high velocity – stock Q4 +50%). Rec: Bundle coats for winter campaigns."
+Once done, return the report.
+""")
+
 def synthesis_node(state: AgentState):
     if not state["insights"]:
         error_summary = json.dumps(state.get("errors", [])) if "errors" in state else "No errors logged."
         state["report"] = f"No insights generated—check manager delegation or sub-agent output. Errors: {error_summary}"
         return state
     trimmed_messages = state["messages"][-5:]
-    synth_prompt = ChatPromptTemplate.from_template("""
-    Synthesize insights from {insights} for the prompt in {messages}. If errors occurred ({errors}), note limitations (e.g., 'Query failed due to syntax—retry suggested').
-    Output in a narrative report style for an executive audience: Use paragraphs with bold figures (e.g., **China: $611,205**), no tables, lists, or bullets. Follow the prompt strictly; do not give recommendations unless explicitly asked. Example for "Which two countries had the lowest sales in 2020?":
-    Lowest Sales Countries in 2020
-    In 2020, our lowest sales regions highlighted areas for potential growth, with distinct patterns in purchasing behavior.
-    Austria: The lowest performer was Austria, generating **$154** in sales, primarily from low-volume urban purchases.
-    Colombia: Colombia followed with **$409.96** in sales, skewed toward seasonal items in coastal areas.
-    Across these regions, sales were concentrated in entry-level products, with limited repeat purchases from urban demographics.
-    Once done, return the report.
-    """)
     formatted_insights = json.dumps(state["insights"])
     formatted_errors = json.dumps(state.get("errors", []))
     formatted_prompt = synth_prompt.format(insights=formatted_insights, messages=trimmed_messages, errors=formatted_errors)
