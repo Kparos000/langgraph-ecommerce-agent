@@ -7,10 +7,25 @@ import re
 from state import AgentState
 from sub_agents import segmentation_agent, trends_agent, geo_agent, product_agent
 from config import get_llm
+import logging  # New: For node traces
+from langchain_core.callbacks import BaseCallbackHandler  # Fixed: Correct import for LangChain/LangGraph compatibility
 
 llm = get_llm()
+logger = logging.getLogger(__name__)
 
-# Improved Manager: Add few-shot for multi-handoff, ambiguity resolution (e.g., "sales" → revenue), clarification for vague
+# New: Custom callback for node/tool traces
+class TraceCallback(BaseCallbackHandler):
+    def on_chain_start(self, serialized, *, run_id, **kwargs):
+        node = serialized.get("name", "unknown")
+        input_keys = list(serialized.get('input', {}).keys()) if isinstance(serialized.get('input'), dict) else []
+        logger.info(f"Starting {node}: Input keys={input_keys}")
+
+    def on_chain_end(self, output, **kwargs):
+        node = kwargs.get("name", "unknown")
+        insights_len = len(output.get("insights", [])) if isinstance(output, dict) else 0
+        logger.info(f"Ended {node}: Output insights len={insights_len}")
+
+# Improved Manager: Add few-shot for multi-handoff, ambiguity resolution (e.g., "sales" → revenue), clarification for vague + Log
 manager_system = """You are ManagerAgent. Classify latest human message for e-commerce analysis (customer segmentation/behavior, sales trends/seasonality, geo patterns, product performance/recs). 'Sales' = revenue ($). If off-topic, output 'next: off_topic' and explain. If vague/ambiguous, ask clarification via message (e.g., 'Revenue or items?'). Otherwise, classify and handoff to 1-4 subs (sequence if multi, e.g., trends first for context).
 Output **only** 'next: [agent_name]' or handoff tools; e.g., 'next: trends' or 'Call TrendsAgent then ProductAgent'.
 Examples:
@@ -33,25 +48,26 @@ def manager_node(state: AgentState):
     try:
         response = manager_chain.invoke({"latest_message": latest_message.content})
     except Exception as e:
-        print(f"Manager chain error: {e}")
+        logger.error(f"Manager chain error: {e}")  # New: Log
         response = AIMessage(content="next: synthesis")
     final_content = response.content.strip()
     if "next: off_topic" in final_content:
         state["next"] = "synthesis"
         state["insights"].append({"agent": "Manager", "text": "Off-topic prompt: Focus on e-commerce analysis."})
         state["messages"] += [response]
+        logger.warning("Off-topic delegation to synthesis")  # New: Log
         return state
     
     if "next: " in final_content:
         next_agent = final_content.split("next: ")[1].strip()
     else:
         next_agent = "synthesis"
-    print(f"Manager delegated to: {next_agent}")
+    logger.info(f"Manager delegated to: {next_agent}")  # Updated: Logger
     state["next"] = next_agent
     state["messages"] += [response]
     return state
 
-# Improved Reflection: Add context for ambiguity (e.g., "sales" = revenue)
+# Improved Reflection: Add context for ambiguity (e.g., "sales" = revenue) + Log
 reflect_system = "You are reflective. Error: {error}. Suggest fix for task in {task_content}. If ambiguous (e.g., 'sales' = revenue $), clarify metric. Output corrected action or 'retry'."
 reflect_prompt = ChatPromptTemplate.from_messages([
     ("system", reflect_system),
@@ -82,24 +98,33 @@ def invoke_sub_agent(agent, state, max_retries=3):
                         json_str = '[]'
             parsed = json.loads(json_str) if json_str else []
             insights_list = parsed if isinstance(parsed, list) else [str(parsed)]
-            print(f"Sub-agent succeeded: {insights_list}")
-            result["messages"][-1] = AIMessage(content=json.dumps({"insights": insights_list}))
+            
+            # New: Extract CoT from last message (OpenAI p. 9: Surface step-by-step)
+            cot_match = re.search(r'Reasoning[:\s]*([^.\n]*?)(?=\n|Final|$)', last_content, re.DOTALL | re.IGNORECASE)
+            cot = cot_match.group(1).strip() if cot_match else ""
+            # Append CoT to parsed insights (list of dicts for weave)
+            parsed_insights_with_cot = [{"text": i, "cot": cot} for i in insights_list] if isinstance(insights_list, list) else [{"text": str(insights_list), "cot": cot}]
+            parsed = {"insights": parsed_insights_with_cot}
+            
+            logger.info(f"Sub-agent succeeded: {len(parsed_insights_with_cot)} insights; CoT excerpt: {cot[:50]}...")  # Updated: Log with CoT
+            result["messages"][-1] = AIMessage(content=json.dumps(parsed))
             if "errors" in state:
                 state["errors"] += [{"type": "success", "agent": str(agent), "retry": retry}]
             return result, True
         except (ValueError, Exception) as e:
-            print(f"Sub-agent failed (retry {retry+1}): {str(e)}")
+            logger.warning(f"Sub-agent failed (retry {retry+1}): {str(e)}")  # New: Log retry
             if retry < max_retries - 1:
                 task_content = trimmed_state["messages"][-1].content
                 try:
                     reflection = reflect_chain.invoke({"error": str(e), "task_content": task_content})
+                    logger.info(f"Reflection generated: {reflection.content[:50]}...")  # New: Log reflection
                 except:
                     reflection = AIMessage(content="Retry with corrected SQL.")
                 trimmed_state["messages"] += [reflection]
                 continue
-            print(f"Sub-agent failed after {max_retries} retries: {str(e)}")
+            logger.error(f"Sub-agent failed after {max_retries} retries: {str(e)}")  # New: Log final
             fallback_insights = ["Fallback: Unable to generate insights after retries."]
-            fallback_result = {"messages": trimmed_state["messages"] + [AIMessage(content=json.dumps({"insights": fallback_insights}))]}
+            fallback_result = {"messages": trimmed_state["messages"] + [AIMessage(content=json.dumps({"insights": [{"text": fallback_insights[0], "cot": ""}]}))]}
             if "errors" in state:
                 state["errors"] += [{"type": "fallback", "agent": str(agent), "error": str(e), "retries": max_retries}]
             return fallback_result, False
@@ -108,7 +133,7 @@ def segmentation_node(state: AgentState):
     result, success = invoke_sub_agent(segmentation_agent, state, max_retries=3)
     if success:
         parsed = json.loads(result["messages"][-1].content)
-        state["insights"].append({"agent": "Segmentation", "text": json.dumps(parsed["insights"])})
+        state["insights"].append({"agent": "Segmentation", "text": [i["text"] for i in parsed["insights"]], "cot": parsed["insights"][0]["cot"] if parsed["insights"] else ""})  # Updated: Include CoT
     state["next"] = "synthesis"
     state["messages"] = result["messages"][-5:]
     return state
@@ -117,7 +142,7 @@ def trends_node(state: AgentState):
     result, success = invoke_sub_agent(trends_agent, state, max_retries=3)
     if success:
         parsed = json.loads(result["messages"][-1].content)
-        state["insights"].append({"agent": "Trends", "text": json.dumps(parsed["insights"])})
+        state["insights"].append({"agent": "Trends", "text": [i["text"] for i in parsed["insights"]], "cot": parsed["insights"][0]["cot"] if parsed["insights"] else ""})  # Updated: Include CoT
     state["next"] = "synthesis"
     state["messages"] = result["messages"][-5:]
     return state
@@ -126,7 +151,7 @@ def geo_node(state: AgentState):
     result, success = invoke_sub_agent(geo_agent, state, max_retries=3)
     if success:
         parsed = json.loads(result["messages"][-1].content)
-        state["insights"].append({"agent": "Geo", "text": json.dumps(parsed["insights"])})
+        state["insights"].append({"agent": "Geo", "text": [i["text"] for i in parsed["insights"]], "cot": parsed["insights"][0]["cot"] if parsed["insights"] else ""})  # Updated: Include CoT
     state["next"] = "synthesis"
     state["messages"] = result["messages"][-5:]
     return state
@@ -135,7 +160,7 @@ def product_node(state: AgentState):
     result, success = invoke_sub_agent(product_agent, state, max_retries=3)
     if success:
         parsed = json.loads(result["messages"][-1].content)
-        state["insights"].append({"agent": "Product", "text": json.dumps(parsed["insights"])})
+        state["insights"].append({"agent": "Product", "text": [i["text"] for i in parsed["insights"]], "cot": parsed["insights"][0]["cot"] if parsed["insights"] else ""})  # Updated: Include CoT
     state["next"] = "synthesis"
     state["messages"] = result["messages"][-5:]
     return state
@@ -158,10 +183,11 @@ def summarizer_node(state: AgentState):
         state["messages"] += [summary]
     return state
 
-# Improved Synthesis Prompt (full, as requested – evolves previous with inference/recs, few-shot, data-volume)
+# Improved Synthesis Prompt (full, as requested – evolves previous with inference/recs, few-shot, data-volume + CoT weave)
 synth_prompt = ChatPromptTemplate.from_template("""
 You are SynthesisAgent. Synthesize insights from {insights} for {messages}. 'Sales' = revenue ($). If errors ({errors}), note limitations (e.g., 'Volume vs revenue ambiguity – retry with $').
 Output narrative report for executive: Bold figures (**China: $611,205**), no tables/lists unless asked. If data >5 rows, 2-3 paras with patterns/recs (e.g., Q4 peak → stock boost; infer from patterns even if not asked); 1 para if sparse; no hallucination/filler – stick to parsed data.
+Include reasoning if present: {cot}.
 Examples:
 - Normal: Insights ['China $598k top'] → "China led 2023 sales at **$598,779** (25% share). US followed **$402,856** (growth opportunity in Asia)."
 - Sparse: Insights ['No 2025 data'] → "No 2025 sales – proxy 2024: Q4 **$508k** low (adjust inventory)."
@@ -176,13 +202,19 @@ def synthesis_node(state: AgentState):
         state["report"] = f"No insights generated—check manager delegation or sub-agent output. Errors: {error_summary}"
         return state
     trimmed_messages = state["messages"][-5:]
-    formatted_insights = json.dumps(state["insights"])
+    formatted_insights = json.dumps([{k: v for k, v in i.items() if k != 'cot'} for i in state["insights"]])  # Exclude CoT from core
     formatted_errors = json.dumps(state.get("errors", []))
-    formatted_prompt = synth_prompt.format(insights=formatted_insights, messages=trimmed_messages, errors=formatted_errors)
-    state["report"] = llm.invoke(formatted_prompt).content
+    formatted_cot = '\n'.join([i.get('cot', '') for i in state["insights"] if i.get('cot')])  # Weave all CoT
+    formatted_prompt = synth_prompt.format(insights=formatted_insights, messages=trimmed_messages, errors=formatted_errors, cot=formatted_cot)
+    try:
+        state["report"] = llm.invoke(formatted_prompt).content + f"\n\n## Reasoning Trace\n{formatted_cot}"  # Updated: Append CoT section
+        logger.info("Synthesis complete with CoT weave")  # New: Log
+    except Exception as e:
+        logger.error(f"Synthesis error: {e}")  # New: Log
+        state["report"] = "Synthesis failed—raw insights: " + formatted_insights
     return state
 
-# Graph (unchanged)
+# Graph (Updated: Remove callbacks from compile; bind at invoke for LangGraph compatibility)
 workflow = StateGraph(AgentState)
 workflow.add_node("manager", manager_node)
 workflow.add_node("segmentation", segmentation_node)
@@ -219,4 +251,4 @@ workflow.add_conditional_edges(
 )
 workflow.add_edge("summarizer", "synthesis")
 workflow.add_edge("synthesis", END)
-app = workflow.compile(checkpointer=MemorySaver())
+app = workflow.compile(checkpointer=MemorySaver())  # Fixed: No callbacks in compile; bind at invoke
