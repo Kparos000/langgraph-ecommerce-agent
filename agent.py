@@ -61,7 +61,7 @@ reflect_chain = reflect_prompt | llm
 
 def invoke_sub_agent(agent, state, max_retries=3):
     trimmed_state = state.copy()
-    trimmed_state["messages"] = state["messages"][-10:]
+    trimmed_state["messages"] = state["messages"][-10:]  # -10 for context retention (balances latency with multi-turn)
     trimmed_state["messages"] = [msg if isinstance(msg, BaseMessage) else HumanMessage(content=str(msg)) if msg[0] == "human" else AIMessage(content=str(msg)) for msg in trimmed_state["messages"]]
     for retry in range(max_retries):
         try:
@@ -158,7 +158,7 @@ def summarizer_node(state: AgentState):
         state["messages"] += [summary]
     return state
 
-# Improved Synthesis: Add few-shot for ambiguity ("sales" = revenue), recs inference, 2-3 paras if >5 insights
+# Improved Synthesis Prompt (full, as requested – evolves previous with inference/recs, few-shot, data-volume)
 synth_prompt = ChatPromptTemplate.from_template("""
 You are SynthesisAgent. Synthesize insights from {insights} for {messages}. 'Sales' = revenue ($). If errors ({errors}), note limitations (e.g., 'Volume vs revenue ambiguity – retry with $').
 Output narrative report for executive: Bold figures (**China: $611,205**), no tables/lists unless asked. If data >5 rows, 2-3 paras with patterns/recs (e.g., Q4 peak → stock boost; infer from patterns even if not asked); 1 para if sparse; no hallucination/filler – stick to parsed data.
@@ -182,7 +182,7 @@ def synthesis_node(state: AgentState):
     state["report"] = llm.invoke(formatted_prompt).content
     return state
 
-# Graph
+# Graph (unchanged)
 workflow = StateGraph(AgentState)
 workflow.add_node("manager", manager_node)
 workflow.add_node("segmentation", segmentation_node)
