@@ -2,6 +2,7 @@ import os
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from google.cloud import bigquery
+import json
 
 # Load .env variables (GEMINI_API_KEY and GOOGLE_APPLICATION_CREDENTIALS)
 load_dotenv()
@@ -23,6 +24,61 @@ def get_bq_client():
     if not key_path:
         raise ValueError("GOOGLE_APPLICATION_CREDENTIALS not set in .env - check path to JSON key.")
     return bigquery.Client.from_service_account_json(key_path)
+
+def get_context(client):
+    """Fetch dynamic context: date range, countries (from users table)."""
+    try:
+        # Date range from order_items
+        date_query = """
+        SELECT MIN(created_at) as min_date, MAX(created_at) as max_date
+        FROM `bigquery-public-data.thelook_ecommerce.order_items`
+        """
+        date_result = client.query(date_query).result()
+        min_date, max_date = next(date_result)
+        date_span = f"{min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}"
+
+        # Countries from users
+        countries_query = """
+        SELECT DISTINCT country
+        FROM `bigquery-public-data.thelook_ecommerce.users`
+        WHERE country IS NOT NULL
+        ORDER BY country
+        """
+        countries_result = client.query(countries_query).result()
+        countries = [row.country for row in countries_result]
+
+        # Seasons/age groups (static but modular)
+        seasons = {
+            "Spring": "Mar-May (Q1 partial)",
+            "Summer": "Jun-Aug (Q2)",
+            "Autumn": "Sep-Nov (Q3)",
+            "Winter": "Dec-Feb (Q4 partial)"
+        }
+        age_groups = {
+            "<18": "Children and teens (0–17 years)",
+            "18–24": "Young adults (including late teens and college-aged)",
+            "25–34": "Millennials and young professionals",
+            "35–54": "Gen X and older Millennials (mature adults)",
+            ">54": "Seniors and retirees"
+        }
+        # Regions: Filtered to dataset countries only (no hallucinations; map based on standard geo groups)
+        regions = {
+            "North America": ["United States"],
+            "South America": ["Brasil", "Colombia"],
+            "EMEA": ["Austria", "Belgium", "France", "Germany", "Poland", "Spain", "United Kingdom"],
+            "Asia Pacific": ["Australia", "Japan", "South Korea"],
+            "China": ["China"]  # Tracked separately per PRD
+        }
+
+        return {
+            "date_span": date_span,
+            "countries": countries,
+            "seasons": seasons,
+            "age_groups": age_groups,
+            "regions": regions
+        }
+    except Exception as e:
+        raise ValueError(f"Context fetch error: {e}")
 
 # Startup test: Validate auth and print metadata (row counts, date ranges, schema)
 if __name__ == "__main__":
@@ -63,6 +119,9 @@ if __name__ == "__main__":
             for field_name, field_type in schema:
                 print(f"  - {field_name}: {field_type}")
             print()
+        # Test context
+        context = get_context(client)
+        print("Context JSON:", json.dumps(context, indent=2))
         print("Dataset metadata retrieved successfully.")
     except Exception as e:
         print(f"Metadata retrieval error: {e}")
