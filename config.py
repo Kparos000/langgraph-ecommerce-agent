@@ -25,6 +25,15 @@ def get_bq_client():
         raise ValueError("GOOGLE_APPLICATION_CREDENTIALS not set in .env - check path to JSON key.")
     return bigquery.Client.from_service_account_json(key_path)
 
+def get_schema(client: bigquery.Client) -> dict:
+    dataset_id = "bigquery-public-data.thelook_ecommerce"
+    tables = client.list_tables(dataset_id)
+    schema = {}
+    for table in tables:
+        table_ref = client.get_table(f"{dataset_id}.{table.table_id}")
+        schema[table.table_id] = [field.to_api_repr() for field in table_ref.schema]
+    return schema
+
 def get_context(client):
     """Fetch dynamic context: date range, countries (from users table)."""
     try:
@@ -119,6 +128,9 @@ if __name__ == "__main__":
             for field_name, field_type in schema:
                 print(f"  - {field_name}: {field_type}")
             print()
+        # Test schema
+        schema = get_schema(client)
+        print("Full Schema JSON:", json.dumps(schema, indent=2))
         # Test context
         context = get_context(client)
         print("Context JSON:", json.dumps(context, indent=2))
