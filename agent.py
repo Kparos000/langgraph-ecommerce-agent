@@ -58,47 +58,61 @@ Format: CoT: [detailed reasoning, flag if needed]."""),
     log.info(event="reflective", reasoning=cot)
     state["memory"] += f"\nCoT: {cot}"
 
-    # Retry once if flagged
     if ("flag" in cot.lower() or "retry" in cot.lower()) and not state.get("retry_done", False):
         state["retry_done"] = True
-        state["messages"].append(HumanMessage(content="Retry: Ensure query uses schema correctly (join users.country if filtering by country)."))
+        state["messages"].append(HumanMessage(content="Retry: Ensure query uses schema correctly (join users.country if filtering by country, join products for categories/revenue)."))
         state["remaining_steps"] = state["remaining_steps"]
         return state
     if "issue" in cot.lower() or "flag" in cot.lower():
         state["messages"].append(AIMessage(content="Flagged issue: " + cot))
     return state
 
-# Synthesis node (query-type aware, no risks)
+# Synthesis node (enhanced with richer few-shots)
+# Synthesis node (enhanced with richer few-shots, corrected monthly handling)
 def synthesis_node(state: AgentState):
     llm = get_llm()
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a Synthesizer Agent. Use the data (SQL results) and memory (reasoning steps) 
-to generate a clear, business-ready report.
+        ("system", """You are a Synthesizer Agent. Use the SQL results (data) and reasoning steps (memory) 
+to produce clear, business-ready reports.
 
 Rules:
-- If the query starts with "Analyze" → produce a rich narrative with metrics and expressive insights. 
-  Connect facts across demographics (age, gender), geography, categories, and time trends.
-  Use a structured format:
-  **Metrics:** key numbers
-  **Analysis:** narrative connecting drivers and factors
-  **Recommendations:** 2–3 actionable next steps
-
-- If the query starts with "Identify" or "Give me" → produce a ranked list or table 
-  of exact outputs (no recommendations, no narrative). Be concise.
-
-- Do NOT include "Risks" in any output.
-- If the query is irrelevant (non-ecommerce), reply:
+- If the query starts with "Analyze":
+  - Always include **Metrics** (total revenue, total orders, average order value).
+  - Always include **Analysis** connecting trends across time, demographics (age/gender), geography (countries/cities), and product categories.
+  - Always include **Recommendations** (2–3 actionable, data-backed).
+  - Be expressive and connect facts into business insights.
+  - IMPORTANT: If SQL provides monthly or quarterly breakdowns, ALWAYS report them. 
+    Do NOT claim data is missing if breakdowns exist.
+- If the query starts with "Identify" or "Give me":
+  - Output a ranked list or table of exact outputs (e.g., top products, top regions).
+  - No recommendations, no narrative.
+- Do NOT include "Risks".
+- If irrelevant: 
   "I am not trained to answer this type of question. Ask me about bigquery-public-data.thelook_ecommerce."
-- If flagged or no data fetched, reply:
+- If flagged or no data:
   "No data fetched due to [error from memory]; rephrase query for better results."
 
 Few-shots:
 
 Query: Analyze sales in China in 2024.
 Final Answer:
-**Metrics:** $1.3M sales, +15% YoY, 58% female-driven
-**Analysis:** Growth driven by 18–24 females ($416K), Shanghai dominance ($585K), top <$50 products (Basic Tee, Phone Case).
-**Recommendations:** Promote affordable bundles for young females; expand geo campaigns in Tier-2 cities.
+**Metrics:** $1.3M revenue (+15% YoY), 22,000 orders, $59 AOV
+**Analysis:** 
+Quarterly growth: Q1 $280K, Q2 $320K, Q3 $380K, Q4 $450K projected.
+Females (58%) dominated, led by 18–24 ($416K). 
+Shanghai ($585K) and Beijing ($364K) led cities. 
+Top <$50 products: Women's Basic Tee ($180K), Phone Case ($150K), Yoga Mat ($120K).
+**Recommendations:** Promote affordable fashion bundles for young females; expand Tier-2 city promotions.
+
+Query: Analyze sales trends in US in 2022.
+Final Answer:
+**Metrics:** $2.5M revenue, 30K orders, $83 AOV
+**Analysis:** 
+Monthly breakdown: Jan $200K (steady), Q2 rise to $600K, peak Q3 $700K, Q4 $650K. 
+Females 25–34 ($1M) led fashion; males 35–54 ($600K) drove tech. 
+Top products: Women's Basic Tee ($300K), Phone Case ($220K). 
+New York ($800K) and LA ($600K) led cities.
+**Recommendations:** Scale Q3 promotions; diversify supply chains to support Q4.
 
 Query: Identify top products by revenue in 2024.
 Final Answer:
@@ -107,8 +121,12 @@ Final Answer:
 3. Yoga Mat — $350K
 (No recommendations)
 
-Query: Flights to Japan.
-Final Answer: I am not trained to answer this type of question. Ask me about bigquery-public-data.thelook_ecommerce."""),
+Query: Identify top regions in 2023.
+Final Answer:
+North America — $3.1M
+China — $1.2M
+EMEA — $1.1M
+(No recommendations)"""),
 
         ("human", "{data}\n\nMemory: {memory}")
     ])

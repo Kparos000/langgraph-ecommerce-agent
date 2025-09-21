@@ -6,13 +6,18 @@ from config import get_bq_client
 
 @tool
 def query_database(sql: str) -> str:
-    """Execute SQL query on BigQuery and return results as JSON."""
+    """Execute SQL query on BigQuery and return results as JSON with retries."""
     client = get_bq_client()
-    try:
-        df = client.query(sql).to_dataframe()
-        return df.to_json(orient="records")
-    except Exception as e:
-        return f"Error: {str(e)}"
+    for attempt in range(3):
+        try:
+            df = client.query(sql).to_dataframe()
+            return df.to_json(orient="records")
+        except Exception as e:
+            if attempt < 2:  # retry up to 2 times
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+                continue
+            return f"Error after {attempt+1} attempts: {str(e)}"
 
 @tool
 def validator(sql: str) -> str:

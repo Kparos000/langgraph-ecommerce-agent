@@ -19,7 +19,7 @@ tools = [query_database, validator, generate_final_answer]
 
 def get_sub_agent_graph(role: str, specialty: str):
     llm = get_llm()
-    # Enhanced prompt with explicit tool-call instructions
+    # Strengthened prompt
     prompt = ChatPromptTemplate.from_messages([
         ("system", f"""You are a {role} Agent specializing in {specialty}.
 You MUST use the available tools to answer queries. Do not ask the user for more information.
@@ -31,21 +31,21 @@ Tables available with schema:
 Context (date ranges, countries, seasons, age groups, regions):
 {{context}}
 
-Always follow this process:
-1. Think step by step (Thought).
-2. Validate SQL with validator.
-3. Run query with query_database.
-4. When you have results, call generate_final_answer with a concise report.
+Rules:
+- ALWAYS use `query_database` and `validator` before `generate_final_answer`.
+- If the query includes a country or region, you MUST join `users` and filter using users.country. 
+  Example: JOIN users u ON o.user_id = u.id AND u.country='United States'.
+- For time-based queries, always use created_at for filtering (YEAR, MONTH, QUARTER).
+- Never output plain text without tool calls.
+- If query is invalid (e.g., out-of-range year or missing country), output Final Answer explaining why.
 
-Output must follow ReAct format with tool calls:
+Output format (ReAct):
 Thought: reasoning
 Action: tool_name
 Action Input: tool_input
 Observation: tool_output
 ... repeat until done
-Final Answer: report
-
-Never output plain text without calling tools. If query is invalid (e.g., out-of-range date/country), respond with Final Answer explaining why."""),
+Final Answer: report"""),
         ("human", "Question: {input}\n\nMemory: {memory}")
     ])
 
