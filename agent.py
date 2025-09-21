@@ -10,11 +10,13 @@ import structlog
 
 log = structlog.get_logger()
 
-# Manager node (from previous)
+# Manager node
 def manager_node(state: AgentState):
     llm = get_llm()
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a Manager Agent. Analyze the input query and delegate to a specialized sub-agent based on keywords. Use memory, context, and schema. Output JSON: {{\"sub_agent\": \"geo\"}}. Available: segmentation, trends, geo, product."),
+        ("system", """You are a Manager Agent. Analyze the input query with reasoning on intent, keywords, memory, context, and schema to delegate to a specialized sub-agent. Available: segmentation (demographics/RFM/behavior), trends (sales/seasonality/growth/trends), geo (geographic/regions/countries/cities), product (performance/recommendations/inventory/products/categories). If query is irrelevant to thelook_ecommerce dataset (e.g., no data-related keywords/intent), delegate to "synthesis" and explain why in reasoning.
+
+Format: Thought: [reason step-by-step on intent/keywords/matching specialty] Final Answer: {{"sub_agent": "value"}}."""),
         ("human", "{input}\n\nMemory: {memory}\nContext: {context}\nSchema: {schema}")
     ])
     chain = prompt | llm
@@ -25,30 +27,27 @@ def manager_node(state: AgentState):
         "context": state["context"]
     })
     try:
-        parsed = json.loads(response.content)
+        final_answer_str = response.content.split("Final Answer:")[-1].strip()
+        parsed = json.loads(final_answer_str)
         sub_agent = parsed.get("sub_agent", "geo")
+        state["memory"] += f"\nManager Reasoning: {response.content}"
     except json.JSONDecodeError:
         sub_agent = "geo"
-        if "segment" in state["messages"][-1].content.lower():
-            sub_agent = "segmentation"
-        elif "trend" in state["messages"][-1].content.lower():
-            sub_agent = "trends"
-        elif "geo" in state["messages"][-1].content.lower():
-            sub_agent = "geo"
-        elif "product" in state["messages"][-1].content.lower():
-            sub_agent = "product"
+        state["memory"] += "\nManager Reasoning: Parse error, default to geo."
     state["remaining_steps"] = sub_agent
     return state
 
-# Reflective node
+# Reflective node with retry
 def reflective_node(state: AgentState):
     llm = get_llm()
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a Reflector Agent. Review the sub-agent's output and data from messages for accuracy. Use CoT: Think step-by-step on SQL validity, data consistency, and flag issues. Update memory with your reasoning."),
+        ("system", """You are a Reflector Agent. Review the sub-agent's output and data from messages for accuracy. Use CoT: Think step-by-step on SQL validity (schema match), data consistency (e.g., dates in context.date_span, countries in context.countries), flag issues (e.g., hallucinations, inconsistencies, no data fetched/SQL executed—must have JSON results from query_database). Update memory with your reasoning. If issue (e.g., no data or text asking for info), append flagged message.
+
+Format: CoT: [detailed reasoning, flag if needed]."""),
         ("human", "{data}\n\nMemory: {memory}\nSchema: {schema}\nContext: {context}")
     ])
     chain = prompt | llm
-    data = state["messages"][-1].content  # Assume last message is sub-agent output
+    data = state["messages"][-1].content
     response = chain.invoke({
         "data": data,
         "memory": state["memory"],
@@ -58,17 +57,62 @@ def reflective_node(state: AgentState):
     cot = response.content
     log.info(event="reflective", reasoning=cot)
     state["memory"] += f"\nCoT: {cot}"
-    if "issue" in cot.lower():
+
+    # Retry once if flagged
+    if ("flag" in cot.lower() or "retry" in cot.lower()) and not state.get("retry_done", False):
+        state["retry_done"] = True
+        state["messages"].append(HumanMessage(content="Retry: Ensure query uses schema correctly (join users.country if filtering by country)."))
+        state["remaining_steps"] = state["remaining_steps"]
+        return state
+    if "issue" in cot.lower() or "flag" in cot.lower():
         state["messages"].append(AIMessage(content="Flagged issue: " + cot))
     return state
 
-# Synthesis node
+# Synthesis node (query-type aware, no risks)
 def synthesis_node(state: AgentState):
     llm = get_llm()
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a Synthesizer Agent. Use data and memory to generate a concise report: Metrics, trends, risks, 2-3 recommendations. Follow few-shot example from Vision: [insert full Vision example here for grounding]."),
+        ("system", """You are a Synthesizer Agent. Use the data (SQL results) and memory (reasoning steps) 
+to generate a clear, business-ready report.
+
+Rules:
+- If the query starts with "Analyze" → produce a rich narrative with metrics and expressive insights. 
+  Connect facts across demographics (age, gender), geography, categories, and time trends.
+  Use a structured format:
+  **Metrics:** key numbers
+  **Analysis:** narrative connecting drivers and factors
+  **Recommendations:** 2–3 actionable next steps
+
+- If the query starts with "Identify" or "Give me" → produce a ranked list or table 
+  of exact outputs (no recommendations, no narrative). Be concise.
+
+- Do NOT include "Risks" in any output.
+- If the query is irrelevant (non-ecommerce), reply:
+  "I am not trained to answer this type of question. Ask me about bigquery-public-data.thelook_ecommerce."
+- If flagged or no data fetched, reply:
+  "No data fetched due to [error from memory]; rephrase query for better results."
+
+Few-shots:
+
+Query: Analyze sales in China in 2024.
+Final Answer:
+**Metrics:** $1.3M sales, +15% YoY, 58% female-driven
+**Analysis:** Growth driven by 18–24 females ($416K), Shanghai dominance ($585K), top <$50 products (Basic Tee, Phone Case).
+**Recommendations:** Promote affordable bundles for young females; expand geo campaigns in Tier-2 cities.
+
+Query: Identify top products by revenue in 2024.
+Final Answer:
+1. Women's Basic Tee — $450K
+2. Phone Case — $400K
+3. Yoga Mat — $350K
+(No recommendations)
+
+Query: Flights to Japan.
+Final Answer: I am not trained to answer this type of question. Ask me about bigquery-public-data.thelook_ecommerce."""),
+
         ("human", "{data}\n\nMemory: {memory}")
     ])
+
     chain = prompt | llm
     data = state["messages"][-1].content if "Flagged issue" not in state["messages"][-1].content else state["messages"][-2].content
     response = chain.invoke({
@@ -100,6 +144,8 @@ def route_to_subagent(state: AgentState):
         return "geo_agent"
     elif sub == "product":
         return "product_agent"
+    elif sub == "synthesis":
+        return "synthesis"
     else:
         return END
 
@@ -119,13 +165,14 @@ if __name__ == "__main__":
     schema = json.dumps(get_schema(client))
     context = get_context(client)
     initial_state = {
-        "messages": [HumanMessage(content="Test geo query: Top regions in 2023?")],
+        "messages": [HumanMessage(content="Analyze sales trends in US in 2022")],
         "remaining_steps": "",
         "memory": "",
         "schema": schema,
         "context": context
     }
     config = {"configurable": {"thread_id": "test1"}}
+    print(f"Input Query: {initial_state['messages'][0].content}")
     result = compiled_graph.invoke(initial_state, config=config)
     print(f"Delegated to: {result['remaining_steps']}")
     print(f"Final report: {result['messages'][-1].content}")
