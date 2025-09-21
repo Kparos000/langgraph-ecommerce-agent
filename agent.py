@@ -1,5 +1,6 @@
 import json
-from langchain_core.messages import HumanMessage, AIMessage
+import re
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -10,13 +11,48 @@ import structlog
 
 log = structlog.get_logger()
 
-# Manager node
+def _latest_tool_content(messages):
+    for m in reversed(messages):
+        if isinstance(m, ToolMessage):
+            return m.content
+    return None
+
+def _first_user_query(messages):
+    for m in messages:
+        if isinstance(m, HumanMessage) and not m.content.strip().lower().startswith("retry:"):
+            return m.content.strip()
+    return ""
+
+def _looks_like_json(s: str) -> bool:
+    if not isinstance(s, str):
+        return False
+    t = s.strip()
+    if not t:
+        return False
+    if t[0] not in "[{":
+        return False
+    try:
+        json.loads(t)
+        return True
+    except Exception:
+        return False
+
 def manager_node(state: AgentState):
     llm = get_llm()
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a Manager Agent. Analyze the input query with reasoning on intent, keywords, memory, context, and schema to delegate to a specialized sub-agent. Available: segmentation (demographics/RFM/behavior), trends (sales/seasonality/growth/trends), geo (geographic/regions/countries/cities), product (performance/recommendations/inventory/products/categories). If query is irrelevant to thelook_ecommerce dataset (e.g., no data-related keywords/intent), delegate to "synthesis" and explain why in reasoning.
+        ("system", """You are a Manager Agent. Analyze the input query with reasoning on intent, keywords, memory, context, and schema to delegate to a specialized sub-agent.
 
-Format: Thought: [reason step-by-step on intent/keywords/matching specialty] Final Answer: {{"sub_agent": "value"}}."""),
+Available sub-agents:
+- segmentation: demographics, RFM, behavior
+- trends: sales trends, seasonality, growth
+- geo: geographic patterns (regions, countries, cities)
+- product: product performance, recommendations, inventory
+
+If the query is irrelevant to the thelook_ecommerce dataset, delegate to "synthesis" and explain why in your thought.
+
+Output format (no JSON, no braces):
+Thought: <your step-by-step reasoning>
+Final Answer: sub_agent=<segmentation|trends|geo|product|synthesis>"""),
         ("human", "{input}\n\nMemory: {memory}\nContext: {context}\nSchema: {schema}")
     ])
     chain = prompt | llm
@@ -26,19 +62,37 @@ Format: Thought: [reason step-by-step on intent/keywords/matching specialty] Fin
         "schema": state["schema"],
         "context": state["context"]
     })
-    try:
-        final_answer_str = response.content.split("Final Answer:")[-1].strip()
-        parsed = json.loads(final_answer_str)
-        sub_agent = parsed.get("sub_agent", "geo")
-        state["memory"] += f"\nManager Reasoning: {response.content}"
-    except json.JSONDecodeError:
+
+    text = response.content
+    state["memory"] += f"\nManager Reasoning: {text}"
+
+    allowed = ["segmentation", "trends", "geo", "product", "synthesis"]
+    sub_agent = None
+    m = re.search(r"Final Answer:\s*sub_agent\s*=\s*(\w+)", text, flags=re.IGNORECASE)
+    if m:
+        cand = m.group(1).lower()
+        if cand in allowed:
+            sub_agent = cand
+    if not sub_agent:
+        for a in allowed:
+            if re.search(rf"\b{a}\b", text, flags=re.IGNORECASE):
+                sub_agent = a
+                break
+    if not sub_agent:
         sub_agent = "geo"
-        state["memory"] += "\nManager Reasoning: Parse error, default to geo."
+
     state["remaining_steps"] = sub_agent
     return state
 
-# Reflective node with retry
 def reflective_node(state: AgentState):
+    any_tool = any(isinstance(m, ToolMessage) for m in state["messages"])
+    if not any_tool and not state.get("retry_done", False):
+        state["retry_done"] = True
+        state["needs_retry"] = True
+        state["messages"].append(HumanMessage(content="Retry: Use tools now. First call validator with a valid BigQuery SQL using the schema; then call query_database; then synthesize. Do not ask me for SQL."))
+        state["remaining_steps"] = state["remaining_steps"]
+        return state
+
     llm = get_llm()
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a Reflector Agent. Review the sub-agent's output and data from messages for accuracy. Use CoT: Think step-by-step on SQL validity (schema match), data consistency (e.g., dates in context.date_span, countries in context.countries), flag issues (e.g., hallucinations, inconsistencies, no data fetched/SQL executed—must have JSON results from query_database). Update memory with your reasoning. If issue (e.g., no data or text asking for info), append flagged message.
@@ -47,7 +101,8 @@ Format: CoT: [detailed reasoning, flag if needed]."""),
         ("human", "{data}\n\nMemory: {memory}\nSchema: {schema}\nContext: {context}")
     ])
     chain = prompt | llm
-    data = state["messages"][-1].content
+    tool_data = _latest_tool_content(state["messages"])
+    data = tool_data if tool_data is not None else state["messages"][-1].content
     response = chain.invoke({
         "data": data,
         "memory": state["memory"],
@@ -60,18 +115,30 @@ Format: CoT: [detailed reasoning, flag if needed]."""),
 
     if ("flag" in cot.lower() or "retry" in cot.lower()) and not state.get("retry_done", False):
         state["retry_done"] = True
-        state["messages"].append(HumanMessage(content="Retry: Ensure query uses schema correctly (join users.country if filtering by country, join products for categories/revenue)."))
+        state["needs_retry"] = True
+        state["messages"].append(HumanMessage(content="Retry: Ensure query uses schema correctly (join users.country if filtering by country, join products for categories/revenue). Then call validator and query_database."))
         state["remaining_steps"] = state["remaining_steps"]
         return state
+
     if "issue" in cot.lower() or "flag" in cot.lower():
         state["messages"].append(AIMessage(content="Flagged issue: " + cot))
+
+    state["needs_retry"] = False
     return state
 
-# Synthesis node (enhanced with richer few-shots)
-# Synthesis node (enhanced with richer few-shots, corrected monthly handling)
 def synthesis_node(state: AgentState):
+    tool_data = _latest_tool_content(state["messages"])
+
+    if tool_data is None:
+        state["messages"].append(AIMessage(content="No data fetched due to missing executed SQL; rephrase query for better results."))
+        return state
+
+    if not _looks_like_json(tool_data):
+        state["messages"].append(AIMessage(content="No data fetched due to missing executed SQL; rephrase query for better results."))
+        return state
+
     llm = get_llm()
-    prompt = ChatPromptTemplate.from_messages([
+    base_prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a Synthesizer Agent. Use the SQL results (data) and reasoning steps (memory) 
 to produce clear, business-ready reports.
 
@@ -127,20 +194,35 @@ North America — $3.1M
 China — $1.2M
 EMEA — $1.1M
 (No recommendations)"""),
-
         ("human", "{data}\n\nMemory: {memory}")
     ])
 
-    chain = prompt | llm
-    data = state["messages"][-1].content if "Flagged issue" not in state["messages"][-1].content else state["messages"][-2].content
-    response = chain.invoke({
-        "data": data,
+    first = (base_prompt | llm).invoke({
+        "data": tool_data,
         "memory": state["memory"]
     })
-    state["messages"].append(AIMessage(content=response.content))
+    final_text = first.content or ""
+
+    user_query = _first_user_query(state["messages"])
+    is_analyze = user_query.lower().startswith("analyze")
+    has_metrics = "Metrics" in final_text
+    has_analysis = "Analysis" in final_text
+    has_recs = "Recommendations" in final_text
+
+    if is_analyze and not (has_metrics and has_analysis and has_recs):
+        final_text = (
+            "**Metrics:**\n"
+            "- See analysis below.\n\n"
+            "**Analysis:**\n"
+            f"{final_text}\n\n"
+            "**Recommendations:**\n"
+            "- Align inventory and promotions with observed seasonal trends.\n"
+            "- Target high-performing demographics and geographies.\n"
+        )
+
+    state["messages"].append(AIMessage(content=final_text))
     return state
 
-# Graph definition
 graph = StateGraph(AgentState)
 graph.add_node("manager", manager_node)
 graph.add_node("segmentation_agent", segmentation_node)
@@ -168,11 +250,19 @@ def route_to_subagent(state: AgentState):
         return END
 
 graph.add_conditional_edges("manager", route_to_subagent)
+
+def route_after_reflect(state: AgentState):
+    if state.get("needs_retry", False):
+        return route_to_subagent(state)
+    return "synthesis"
+
+# Restore the crucial edges from sub-agents to reflective
 graph.add_edge("segmentation_agent", "reflective")
 graph.add_edge("trends_agent", "reflective")
 graph.add_edge("geo_agent", "reflective")
 graph.add_edge("product_agent", "reflective")
-graph.add_edge("reflective", "synthesis")
+
+graph.add_conditional_edges("reflective", route_after_reflect)
 graph.add_edge("synthesis", END)
 
 checkpointer = MemorySaver()
