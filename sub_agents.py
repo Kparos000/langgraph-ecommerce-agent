@@ -7,7 +7,7 @@ from typing import Dict, List, Annotated
 from operator import add
 from state import AgentState
 from langgraph.checkpoint.memory import MemorySaver
-import re, json
+import re, json, os
 
 class SubAgentState(Dict):
     messages: Annotated[List[BaseMessage], add]
@@ -167,6 +167,12 @@ def _run_validated_sql_and_append(state: AgentState, sql: str, tool_id_prefix: s
     if isinstance(val, str) and val.strip().lower() == "valid":
         out = query_database.invoke({"sql": sql})
         state["messages"].append(ToolMessage(content=out, tool_call_id=f"{tool_id_prefix}_query"))
+        if os.getenv("PRINT_SQL") == "1":
+            try:
+                rows = json.loads(out) if isinstance(out, str) else []
+                print(f"\n[DEBUG] Ran SQL ({tool_id_prefix}):\n{sql}\n[DEBUG] Rows returned: {len(rows)}\n")
+            except Exception:
+                print(f"\n[DEBUG] Ran SQL ({tool_id_prefix}):\n{sql}\n[DEBUG] Rows returned: ? (non-JSON)\n")
         return out
     return None
 
@@ -218,7 +224,28 @@ def _has_tool_message(messages: List[BaseMessage], prefix: str | None = None) ->
                 return True
     return False
 
+def _has_timeseries(messages: List[BaseMessage]) -> bool:
+    """Detect whether a monthly/quarterly time-series is already present among ToolMessage payloads."""
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            tid = m.tool_call_id or ""
+            if tid.startswith("manual_trends"):
+                return True
+            # SQL hint
+            if tid.endswith("_sql") and "EXTRACT(" in (m.content or "") and ("MONTH" in m.content or "QUARTER" in m.content):
+                return True
+            # Data hint
+            try:
+                rows = json.loads(m.content)
+                if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                    if any(("month" in r) or ("quarter" in r) for r in rows):
+                        return True
+            except Exception:
+                pass
+    return False
+
 def trends_node(state: AgentState):
+    # Let the LLM sub-agent run first (preserve ReAct)
     sub_state = {
         "messages": state["messages"],
         "memory": state["memory"],
@@ -228,12 +255,17 @@ def trends_node(state: AgentState):
     result = trends_graph.invoke(sub_state)
     state["messages"] = result["messages"]
 
+    # Deterministic guard: ensure monthly time-series exists for Analyze/trend queries
     question = state["messages"][0].content if state["messages"] else ""
-    ddl_like = re.search(r"\b(select|insert|update|delete|drop|alter|create)\b", question.lower())
+    ddl_like = re.search(r"\b(select|insert|update|delete|drop|alter|create)\b", (question or "").lower())
+    text = (question or "").lower()
+    analyze_like = text.startswith("analyze") or "trend" in text
+
     info = _extract_year_and_country(question, state.get("context", {}))
     year = info.get("year") or 2022
     country = info.get("country") or "United States"
 
+    # If no tools ran at all and not a DDL/DML prompt, produce a monthly series
     if not _has_tool_message(state["messages"]) and not ddl_like:
         sql = _build_trends_sql(year, country)
         out = _run_validated_sql_and_append(state, sql, "manual_trends")
@@ -249,6 +281,23 @@ def trends_node(state: AgentState):
             except Exception:
                 pass
 
+    # If this is an analyze/trend ask, enforce monthly series if still missing
+    if analyze_like and not ddl_like and not _has_timeseries(state["messages"]):
+        sql = _build_trends_sql(year, country)
+        out = _run_validated_sql_and_append(state, sql, "manual_trends")
+        if out:
+            try:
+                rows = json.loads(out) if isinstance(out, str) else []
+                metrics = _compute_metrics_from_rows(rows)
+                metrics.update({"period": str(year), "country": country})
+                state["messages"].append(ToolMessage(content=json.dumps(metrics), tool_call_id="manual_metrics"))
+                summary = _compute_trend_summary(rows)
+                if summary:
+                    state["messages"].append(ToolMessage(content=summary, tool_call_id="manual_summary"))
+            except Exception:
+                pass
+
+    # Auto-augment demographics/categories/cities/price bands only for "Analyze ..."
     if question.lower().startswith("analyze") and not ddl_like:
         dataset = "bigquery-public-data.thelook_ecommerce"
 
