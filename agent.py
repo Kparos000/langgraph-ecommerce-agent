@@ -1,5 +1,6 @@
 import json
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from typing import List  # <-- fix: import List
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -28,11 +29,11 @@ Format: Thought: [reason step-by-step on intent/keywords/matching specialty] Fin
     try:
         final_answer_str = response.content.split("Final Answer:")[-1].strip()
         parsed = json.loads(final_answer_str)
-        sub_agent = parsed.get("sub_agent", "geo")
+        sub_agent = parsed.get("sub_agent", "trends")
         state["memory"] += f"\nManager Reasoning: {response.content}"
     except json.JSONDecodeError:
-        sub_agent = "geo"
-        state["memory"] += "\nManager Reasoning: Parse error, default to geo."
+        sub_agent = "trends"
+        state["memory"] += "\nManager Reasoning: Parse error, default to trends."
     state["remaining_steps"] = sub_agent
     return state
 
@@ -58,108 +59,65 @@ Format: CoT: [detailed reasoning, flag if needed]."""),
 
     if ("flag" in cot.lower() or "retry" in cot.lower()) and not state.get("retry_done", False):
         state["retry_done"] = True
-        state["messages"].append(HumanMessage(content="Retry: Ensure monthly trends SQL is executed and join users.country when filtering by country."))
+        state["messages"].append(HumanMessage(content="Retry: Ensure query uses schema correctly (join users.country if filtering by country, join products for categories/revenue)."))
         state["remaining_steps"] = state["remaining_steps"]
         return state
     if "issue" in cot.lower() or "flag" in cot.lower():
         state["messages"].append(AIMessage(content="Flagged issue: " + cot))
     return state
 
-def _collect_tool_observations(messages: list[BaseMessage]) -> dict:
-    bundle = {
-        "monthly_rows": None,
-        "metrics": None,
-        "trend_summary": None,
-        "gender_rows": None,
-        "age_rows": None,
-        "category_rows": None,
-        "city_rows": None,
-        "price_band_rows": None,
-        "weekday_rows": None
-    }
+def _collect_curated_tooldata(messages: List[BaseMessage]) -> str:
+    chunks = []
+    last_query_snippet = None
     for m in messages:
-        if not isinstance(m, AIMessage) and not isinstance(m, HumanMessage):
-            # LangChain ToolMessage implements BaseMessage; we check tool_call_id hints we created
-            tool_call_id = getattr(m, "tool_call_id", "") or ""
-            content = getattr(m, "content", "")
-            if not isinstance(content, str):
-                continue
-            # Query outputs end with *_query ids in our sub_agents
-            if tool_call_id.endswith("manual_trends_query"):
-                try:
-                    bundle["monthly_rows"] = json.loads(content)
-                except Exception:
-                    pass
-            elif tool_call_id == "manual_metrics":
-                try:
-                    bundle["metrics"] = json.loads(content)
-                except Exception:
-                    pass
-            elif tool_call_id == "manual_summary":
-                bundle["trend_summary"] = content
-            elif tool_call_id.endswith("manual_gender_query"):
-                try:
-                    bundle["gender_rows"] = json.loads(content)
-                except Exception:
-                    pass
-            elif tool_call_id.endswith("manual_age_query"):
-                try:
-                    bundle["age_rows"] = json.loads(content)
-                except Exception:
-                    pass
-            elif tool_call_id.endswith("manual_categories_query"):
-                try:
-                    bundle["category_rows"] = json.loads(content)
-                except Exception:
-                    pass
-            elif tool_call_id.endswith("manual_cities_query"):
-                try:
-                    bundle["city_rows"] = json.loads(content)
-                except Exception:
-                    pass
-            elif tool_call_id.endswith("manual_price_bands_query"):
-                try:
-                    bundle["price_band_rows"] = json.loads(content)
-                except Exception:
-                    pass
-            elif tool_call_id.endswith("manual_weekday_query"):
-                try:
-                    bundle["weekday_rows"] = json.loads(content)
-                except Exception:
-                    pass
-    return bundle
+        if isinstance(m, ToolMessage) and m.tool_call_id:
+            tid = m.tool_call_id
+            if tid.endswith("_sql"):
+                last_query_snippet = m.content
+            elif tid.endswith("_query"):
+                if any(tid.startswith(prefix) for prefix in [
+                    "manual_trends", "manual_gender", "manual_age",
+                    "manual_categories", "manual_cities", "manual_price_bands",
+                    "manual_products_under_threshold"
+                ]):
+                    label = tid.replace("_query", "")
+                    chunks.append(f"{label} => {m.content}")
+            elif tid == "manual_metrics":
+                chunks.append(f"manual_metrics => {m.content}")
+            elif tid == "manual_summary":
+                chunks.append(f"manual_summary => {m.content}")
+    if last_query_snippet:
+        chunks.insert(0, f"executed_sql => {last_query_snippet}")
+    return "\n".join(chunks) if chunks else ""
 
 def synthesis_node(state: AgentState):
     llm = get_llm()
+    curated = _collect_curated_tooldata(state["messages"])
+
     base_prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a Synthesizer Agent. Write a polished, business-ready report using the structured data bundle below.
-Follow these rules:
-- If the user query starts with "Analyze":
-  - Output a concise executive header with: total revenue, total orders, AOV.
-  - Then an expressive analysis that ties together: time trend (use monthly), seasonality (quarters), demographics (gender, age), geography (cities), and categories/price bands if available.
-  - Use sentences and comparisons (e.g., “Q3 outpaced Q2 by ~12%”; “Females led with $X vs $Y for males”).
-  - 2–3 concrete recommendations. No “Risks”.
+        ("system", """You are a Synthesizer Agent. Use the SQL results (month-by-month time series, plus gender/age/categories/cities/price bands) and reasoning steps (memory) to produce a focused, business-ready report.
+
+Rules:
+- If the query starts with "Analyze":
+  - Include **Metrics** (total revenue, total orders, AOV).
+  - Provide a narrative **Analysis**: describe monthly/quarterly trend (rise/peak/slowdown), then key demographics (gender, age), leading categories/products, and top cities (if present).
+  - Close with 2–3 **Recommendations**. Keep them tied to the observed data. No "Risks" section.
+  - Do NOT mention weekday performance unless explicitly asked. If any weekday slice appears in the tool data, ignore it.
 - If the query starts with "Identify" or "Give me":
-  - Output only the exact numbers or a short ranked list/table. No recommendations.
-- Never show internal labels or tool IDs. Do not mention weekdays unless the user asked for weekdays.
-- If the monthly_rows is missing and there’s no metrics, say: "No data fetched due to missing executed SQL; rephrase query for better results."
-"""),
-        ("human", "User Query:\n{query}\n\nStructured Data Bundle (JSON):\n{bundle_json}\n\nMemory Hints:\n{memory}")
+  - Return a concise ranked list or table. No recommendations.
+- If irrelevant: respond with "I am not trained to answer this type of question. Ask me about bigquery-public-data.thelook_ecommerce."
+- If flagged or no usable data: "No data fetched due to [error from memory]; rephrase query for better results."
+
+Strictly avoid including raw JSON blobs in the final answer. Convert numbers into readable sentences and short bullet points when needed."""),
+        ("human", "Curated tool data:\n{curated}\n\nMemory:\n{memory}\n\nUser query:\n{query}")
     ])
 
-    # Build a data bundle from all tool observations in this turn
-    bundle = _collect_tool_observations(state["messages"])
-    try:
-        bundle_json = json.dumps(bundle)
-    except Exception:
-        bundle_json = "{}"
-
-    query_txt = state["messages"][0].content if state["messages"] else ""
     chain = base_prompt | llm
+    data_for_synth = curated or (state["messages"][-1].content if state["messages"] else "")
     response = chain.invoke({
-        "query": query_txt,
-        "bundle_json": bundle_json,
-        "memory": state["memory"]
+        "curated": data_for_synth,
+        "memory": state["memory"],
+        "query": state["messages"][0].content if state["messages"] else ""
     })
     state["messages"].append(AIMessage(content=response.content))
     return state
@@ -206,7 +164,7 @@ if __name__ == "__main__":
     schema = json.dumps(get_schema(client))
     context = get_context(client)
     initial_state = {
-        "messages": [HumanMessage(content="Analyze sales in China in 2022")],
+        "messages": [HumanMessage(content="Analyze sales trends in US in 2022")],
         "remaining_steps": "",
         "memory": "",
         "schema": schema,

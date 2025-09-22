@@ -2,7 +2,7 @@ from langgraph.graph import StateGraph, END
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import ToolMessage, AIMessage, BaseMessage
 from config import get_llm
-from tools import query_database, validator, generate_final_answer, get_holidays
+from tools import query_database, validator, generate_final_answer
 from typing import Dict, List, Annotated
 from operator import add
 from state import AgentState
@@ -15,7 +15,7 @@ class SubAgentState(Dict):
     schema: str
     context: Dict
 
-tools = [query_database, validator, generate_final_answer, get_holidays]
+tools = [query_database, validator, generate_final_answer]
 
 def get_sub_agent_graph(role: str, specialty: str):
     llm = get_llm()
@@ -34,10 +34,9 @@ Rules:
 - ALWAYS call `validator` then `query_database` before `generate_final_answer`.
 - If the query includes a country or region, you MUST join `users` and filter using users.country.
   Example: JOIN `bigquery-public-data.thelook_ecommerce.users` u ON o.user_id = u.id AND u.country='United States'.
-- For time-based queries, always use created_at for filtering (YEAR, MONTH, QUARTER).
-- If the query mentions 'holiday', 'Black Friday', 'Thanksgiving', 'Halloween', or 'Singles' Day', first call `get_holidays(country, year, holiday)` to get exact date ranges, then filter created_at BETWEEN those dates (combine multiple periods with OR).
+- For time-based queries, always use created_at (YEAR, MONTH, QUARTER) for filtering.
 - Never output plain text without tool calls.
-- If query is invalid (e.g., out-of-range year or missing valid country), output Final Answer explaining why.
+- If query is invalid (e.g., out-of-range year or missing country), output Final Answer explaining why.
 
 Output format (ReAct):
 Thought: reasoning
@@ -70,7 +69,7 @@ Final Answer: report"""),
                 f"{question}\n\n"
                 "Follow-up: Use tools now. First call validator with a valid BigQuery SQL built from the schema; "
                 "then call query_database with that SQL; only then produce Final Answer. "
-                "If 'holiday' is present, call get_holidays(country, year) and apply BETWEEN filters."
+                "Do not ask me for SQL."
             )
             second = chain.invoke({
                 "input": followup,
@@ -125,6 +124,7 @@ def _extract_year_and_country(question: str, context: Dict) -> Dict:
     m = re.search(r"\b(20\d{2})\b", text)
     if m:
         year = int(m.group(1))
+
     country = None
     if " usa " in f" {text} " or " u.s. " in f" {text} " or " us " in f" {text} ":
         country = "United States"
@@ -141,34 +141,8 @@ def _parse_under_threshold(question: str) -> int | None:
         return int(m.group(1))
     return None
 
-def _parse_weekday(question: str) -> int | None:
-    text = question.lower()
-    mapping = {
-        "sunday": 1, "sun": 1,
-        "monday": 2, "mon": 2,
-        "tuesday": 3, "tue": 3, "tues": 3,
-        "wednesday": 4, "wed": 4,
-        "thursday": 5, "thu": 5, "thur": 5, "thurs": 5,
-        "friday": 6, "fri": 6,
-        "saturday": 7, "sat": 7
-    }
-    for k, v in mapping.items():
-        if k in text:
-            return v
-    return None
-
-def _parse_quarter(question: str) -> int | None:
-    m = re.search(r"\bq([1-4])\b", question.lower())
-    if m:
-        return int(m.group(1))
-    return None
-
-def _build_trends_sql(year: int, country: str, date_filters: str | None = None) -> str:
+def _build_trends_sql(year: int, country: str) -> str:
     dataset = "bigquery-public-data.thelook_ecommerce"
-    where = [f"EXTRACT(YEAR FROM o.created_at) = {year}", f"u.country = '{country}'"]
-    if date_filters:
-        where.append(f"({date_filters})")
-    where_clause = " AND ".join(where)
     return f"""
 SELECT
   EXTRACT(YEAR FROM o.created_at) AS year,
@@ -180,32 +154,10 @@ JOIN `{dataset}.order_items` oi
   ON oi.order_id = o.order_id
 JOIN `{dataset}.users` u
   ON u.id = o.user_id
-WHERE {where_clause}
+WHERE EXTRACT(YEAR FROM o.created_at) = {year}
+  AND u.country = '{country}'
 GROUP BY year, month
 ORDER BY month
-""".strip()
-
-def _build_identify_aggregate_sql(year: int, country: str, weekday: int | None, quarter: int | None, date_filters: str | None = None) -> str:
-    dataset = "bigquery-public-data.thelook_ecommerce"
-    where = [f"EXTRACT(YEAR FROM o.created_at) = {year}", f"u.country = '{country}'"]
-    if weekday:
-        where.append(f"EXTRACT(DAYOFWEEK FROM o.created_at) = {weekday}")
-    if quarter:
-        months = "(1,2,3)" if quarter == 1 else "(4,5,6)" if quarter == 2 else "(7,8,9)" if quarter == 3 else "(10,11,12)"
-        where.append(f"EXTRACT(MONTH FROM o.created_at) IN {months}")
-    if date_filters:
-        where.append(f"({date_filters})")
-    where_clause = " AND ".join(where)
-    return f"""
-SELECT
-  COUNT(DISTINCT o.order_id) AS orders,
-  SUM(oi.sale_price) AS revenue
-FROM `{dataset}.orders` o
-JOIN `{dataset}.order_items` oi
-  ON oi.order_id = o.order_id
-JOIN `{dataset}.users` u
-  ON u.id = o.user_id
-WHERE {where_clause}
 """.strip()
 
 def _run_validated_sql_and_append(state: AgentState, sql: str, tool_id_prefix: str):
@@ -257,6 +209,15 @@ def _compute_trend_summary(rows: List[dict]) -> str:
         trend += " Seasonality: " + ", ".join(seasonality) + "."
     return trend
 
+def _has_tool_message(messages: List[BaseMessage], prefix: str | None = None) -> bool:
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            if prefix is None:
+                return True
+            if m.tool_call_id and m.tool_call_id.startswith(prefix):
+                return True
+    return False
+
 def trends_node(state: AgentState):
     sub_state = {
         "messages": state["messages"],
@@ -273,39 +234,8 @@ def trends_node(state: AgentState):
     year = info.get("year") or 2022
     country = info.get("country") or "United States"
 
-    holiday_hint = None
-    if any(h in question.lower() for h in ["holiday", "black friday", "thanksgiving", "halloween", "singles"]):
-        if "black friday" in question.lower():
-            holiday_hint = "Black Friday"
-        elif "thanksgiving" in question.lower():
-            holiday_hint = "Thanksgiving"
-        elif "halloween" in question.lower():
-            holiday_hint = "Halloween"
-        elif "singles" in question.lower():
-            holiday_hint = "Singles’ Day"
-
-    date_filters = None
-    if "holiday" in question.lower() or holiday_hint:
-        args = {"country": country, "year": int(year)}
-        if holiday_hint:
-            args["holiday"] = holiday_hint
-        resp = get_holidays.invoke(args)
-        try:
-            periods = json.loads(resp) if isinstance(resp, str) else []
-        except Exception:
-            periods = []
-        parts = []
-        for p in periods:
-            start = p.get("start")
-            end = p.get("end")
-            if start and end:
-                parts.append(f"(DATE(o.created_at) BETWEEN '{start}' AND '{end}')")
-        if parts:
-            state["messages"].append(ToolMessage(content=resp, tool_call_id="manual_holidays"))
-            date_filters = " OR ".join(parts)
-
-    if not ddl_like:
-        sql = _build_trends_sql(year, country, date_filters)
+    if not _has_tool_message(state["messages"]) and not ddl_like:
+        sql = _build_trends_sql(year, country)
         out = _run_validated_sql_and_append(state, sql, "manual_trends")
         if out:
             try:
@@ -318,12 +248,6 @@ def trends_node(state: AgentState):
                     state["messages"].append(ToolMessage(content=summary, tool_call_id="manual_summary"))
             except Exception:
                 pass
-
-    if question.lower().startswith("identify") or question.lower().startswith("give me"):
-        weekday = _parse_weekday(question)
-        quarter = _parse_quarter(question)
-        sql_id = _build_identify_aggregate_sql(year, country, weekday, quarter, date_filters)
-        _run_validated_sql_and_append(state, sql_id, "manual_identify")
 
     if question.lower().startswith("analyze") and not ddl_like:
         dataset = "bigquery-public-data.thelook_ecommerce"
@@ -415,19 +339,6 @@ GROUP BY price_band
 ORDER BY revenue DESC
 """.strip()
         _run_validated_sql_and_append(state, sql_pricebands, "manual_price_bands")
-
-        sql_weekday = f"""
-SELECT EXTRACT(DAYOFWEEK FROM o.created_at) AS dow,
-       COUNT(DISTINCT o.order_id) AS orders,
-       SUM(oi.sale_price) AS revenue
-FROM `{dataset}.orders` o
-JOIN `{dataset}.order_items` oi ON oi.order_id = o.order_id
-JOIN `{dataset}.users` u ON u.id = o.user_id
-WHERE EXTRACT(YEAR FROM o.created_at) = {year} AND u.country = '{country}'
-GROUP BY dow
-ORDER BY dow
-""".strip()
-        _run_validated_sql_and_append(state, sql_weekday, "manual_weekday")
 
     state["needs_retry"] = False
     return state
