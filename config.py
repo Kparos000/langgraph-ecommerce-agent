@@ -1,13 +1,28 @@
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from google.cloud import bigquery
 import google.auth
 from google.auth.exceptions import DefaultCredentialsError
 import json
 
-# Load .env variables (GEMINI_API_KEY and optionally GOOGLE_APPLICATION_CREDENTIALS)
-load_dotenv()
+# Load .env robustly (find nearest .env from CWD; allow overrides on re-run)
+load_dotenv(find_dotenv(usecwd=True), override=True)
+
+def tracing_status() -> dict:
+    """Quick check that LangSmith tracing env vars are loaded."""
+    tracing = str(os.getenv("LANGCHAIN_TRACING_V2", "")).lower() in ("1", "true", "yes")
+    project = os.getenv("LANGCHAIN_PROJECT")
+    has_api_key = bool(os.getenv("LANGCHAIN_API_KEY"))
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    creds_exists = bool(creds_path) and os.path.isfile(creds_path)
+    return {
+        "tracing": tracing,
+        "project": project,
+        "has_api_key": has_api_key,
+        "google_application_credentials": creds_path,
+        "google_application_credentials_exists": creds_exists,
+    }
 
 def get_llm():
     api_key = os.getenv("GEMINI_API_KEY")
@@ -109,6 +124,7 @@ def get_context(client):
 
 if __name__ == "__main__":
     try:
+        print("Tracing status:", json.dumps(tracing_status(), indent=2))
         client = get_bq_client()
         dataset = "bigquery-public-data.thelook_ecommerce"
         tables = ["orders", "order_items", "products", "users"]
