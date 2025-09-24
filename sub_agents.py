@@ -160,6 +160,34 @@ GROUP BY year, month
 ORDER BY month
 """.strip()
 
+def _build_categories_sql_optional_country(year: int, country: str | None, limit: int = 5) -> str:
+    """
+    Build Top Categories SQL. If a country is provided, join users and filter by country.
+    If no country is provided, run GLOBAL (no users join, no country filter).
+    """
+    dataset = "bigquery-public-data.thelook_ecommerce"
+    base = f"""
+SELECT p.category, COUNT(DISTINCT o.order_id) AS orders, SUM(oi.sale_price) AS revenue
+FROM `{dataset}.orders` o
+JOIN `{dataset}.order_items` oi ON oi.order_id = o.order_id
+JOIN `{dataset}.products` p ON p.id = oi.product_id
+"""
+    if country:
+        base += """
+JOIN `bigquery-public-data.thelook_ecommerce.users` u ON u.id = o.user_id
+"""
+    base += f"""
+WHERE EXTRACT(YEAR FROM o.created_at) = {year}
+"""
+    if country:
+        base += f"  AND u.country = '{country}'\n"
+    base += f"""
+GROUP BY p.category
+ORDER BY revenue DESC
+LIMIT {limit}
+"""
+    return base.strip()
+
 def _run_validated_sql_and_append(state: AgentState, sql: str, tool_id_prefix: str):
     state["messages"].append(ToolMessage(content=sql, tool_call_id=f"{tool_id_prefix}_sql"))
     val = validator.invoke({"sql": sql})
@@ -331,17 +359,9 @@ ORDER BY revenue DESC
 """.strip()
         _run_validated_sql_and_append(state, sql_age, "manual_age")
 
-        sql_categories = f"""
-SELECT p.category, COUNT(DISTINCT o.order_id) AS orders, SUM(oi.sale_price) AS revenue
-FROM `{dataset}.orders` o
-JOIN `{dataset}.order_items` oi ON oi.order_id = o.order_id
-JOIN `{dataset}.products` p ON p.id = oi.product_id
-JOIN `{dataset}.users` u ON u.id = o.user_id
-WHERE EXTRACT(YEAR FROM o.created_at) = {year} AND u.country = '{country}'
-GROUP BY p.category
-ORDER BY revenue DESC
-LIMIT 5
-""".strip()
+        # NOTE: use optional-country builder for categories so we can support global if no country given in the query
+        raw_country = _extract_year_and_country(question, state.get("context", {})).get("country")
+        sql_categories = _build_categories_sql_optional_country(year, raw_country, limit=5)
         _run_validated_sql_and_append(state, sql_categories, "manual_categories")
 
         threshold = _parse_under_threshold(question)
@@ -388,6 +408,14 @@ GROUP BY price_band
 ORDER BY revenue DESC
 """.strip()
         _run_validated_sql_and_append(state, sql_pricebands, "manual_price_bands")
+
+    # If the user explicitly asks to identify top categories (even without "Analyze"), run it too
+    lc = (question or "").lower()
+    if (("identify" in lc or "top" in lc) and "categor" in lc) and not ddl_like:
+        raw_country = _extract_year_and_country(question, state.get("context", {})).get("country")
+        year2 = _extract_year_and_country(question, state.get("context", {})).get("year") or year
+        sql_topcats = _build_categories_sql_optional_country(year2, raw_country, limit=5)
+        _run_validated_sql_and_append(state, sql_topcats, "manual_top_categories")
 
     state["needs_retry"] = False
     return state

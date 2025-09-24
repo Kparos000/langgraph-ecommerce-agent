@@ -1,216 +1,199 @@
+import os
 import json
-import uuid
-from typing import List, Optional
+from pathlib import Path
+from typing import Optional
 
 import streamlit as st
-
-from langchain_core.messages import BaseMessage, ToolMessage
-from agent import compiled_graph  # uses your current agent.py graph
-from config import get_bq_client, get_schema, get_context, tracing_status
 from langchain_core.messages import HumanMessage
+from config import get_bq_client, get_schema, get_context
+from agent import compiled_graph
 
-# ---------- Page / Session Setup ----------
-st.set_page_config(page_title="E-commerce LangGraph Agent", page_icon="🛒", layout="wide")
+# ---------- Page & basic styles ----------
+st.set_page_config(
+    page_title="TheLook E-commerce Analyst",
+    page_icon="📊",
+    layout="wide"
+)
 
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = f"ui-{uuid.uuid4().hex[:8]}"
-if "query_count" not in st.session_state:
-    st.session_state.query_count = 0
-if "history" not in st.session_state:
-    st.session_state.history = []  # list of dicts: {query, report, delegated, sample_rows, executed_sql}
+# Simple dark/light toggle using CSS (Streamlit does not hot-swap themes at runtime)
+if "dark_mode" not in st.session_state:
+    st.session_state.dark_mode = False
 
-# ---------- Helpers ----------
-def _first_tool_rows(messages: List[BaseMessage]) -> Optional[List[dict]]:
-    """
-    Try to find the first tool result (JSON array of rows) to preview.
-    """
-    for m in messages:
-        if isinstance(m, ToolMessage) and m.tool_call_id and m.tool_call_id.endswith("_query"):
-            try:
-                data = json.loads(m.content)
-                if isinstance(data, list):
-                    return data[:5]
-            except Exception:
-                continue
-    return None
+def apply_theme(dark: bool):
+    if dark:
+        st.markdown(
+            """
+            <style>
+            html, body, [data-testid="stAppViewContainer"] {
+                background-color: #0E1117 !important;
+                color: #FAFAFA !important;
+            }
+            .stTextInput textarea, .stTextArea textarea, .stTextInput input, .stTextArea, .stButton>button {
+                color: #FAFAFA !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            "<style>/* reset custom dark css if any */</style>",
+            unsafe_allow_html=True
+        )
 
-def _last_executed_sql(messages: List[BaseMessage]) -> Optional[str]:
-    """
-    If the sub-agent appended executed SQL (via manual_*_sql ToolMessage), show it.
-    """
-    last_sql = None
-    for m in messages:
-        if isinstance(m, ToolMessage) and m.tool_call_id and m.tool_call_id.endswith("_sql"):
-            last_sql = m.content
-    return last_sql
+apply_theme(st.session_state.dark_mode)
 
-def _delegated_to(memory: str) -> Optional[str]:
-    """
-    We append manager reasoning to state['memory'] in agent.py.
-    Try to extract the last chosen sub-agent from that text.
-    """
-    if not memory:
-        return None
-    # naive scan; your manager writes 'Final Answer: {"sub_agent": "..."}'
-    lower = memory.lower()
-    marker = 'final answer:'
-    if marker in lower:
+# ---------- Utilities ----------
+QUERY_COUNT_PATH = Path("query_count.json")
+
+def get_query_count() -> int:
+    if QUERY_COUNT_PATH.exists():
         try:
-            frag = memory[lower.rfind(marker) + len(marker):].strip()
-            j = json.loads(frag)
-            return j.get("sub_agent")
+            return int(json.loads(QUERY_COUNT_PATH.read_text()).get("count", 0))
         except Exception:
-            return None
-    return None
+            return 0
+    return 0
 
-def run_agent_once(user_query: str):
-    """
-    Execute the compiled graph for a single query; return structured outputs for the UI.
-    """
-    # Build schema/context once per process; memoize via st.cache_data to save latency
-    @st.cache_data(show_spinner=False)
-    def _bootstrap():
-        client = get_bq_client()
-        schema = json.dumps(get_schema(client))
-        context = get_context(client)
-        return schema, context
+def increment_query_count() -> int:
+    count = get_query_count() + 1
+    QUERY_COUNT_PATH.write_text(json.dumps({"count": count}))
+    return count
 
-    schema, context = _bootstrap()
+@st.cache_resource(show_spinner=False)
+def bootstrap_context():
+    # One-time BigQuery context bootstrap
+    client = get_bq_client()
+    schema = json.dumps(get_schema(client))
+    context = get_context(client)
+    return client, schema, context
 
+def run_agent(user_query: str, schema: str, context: dict):
     initial_state = {
         "messages": [HumanMessage(content=user_query)],
         "remaining_steps": "",
         "memory": "",
         "schema": schema,
-        "context": context,
+        "context": context
     }
-    config = {"configurable": {"thread_id": st.session_state.thread_id}}
-
+    config = {"configurable": {"thread_id": "ui"}}
     result = compiled_graph.invoke(initial_state, config=config)
+    return result
 
-    # Pull final report (LLM response at the end)
-    final_report = result["messages"][-1].content if result.get("messages") else ""
-
-    # Try to detect which sub-agent was delegated (from memory trail)
-    delegated = _delegated_to(result.get("memory", "")) or result.get("remaining_steps", "")
-
-    # Sample rows + last executed SQL (if present)
-    sample_rows = _first_tool_rows(result.get("messages", [])) or []
-    executed_sql = _last_executed_sql(result.get("messages", []))
-
-    return {
-        "report": final_report,
-        "delegated": delegated,
-        "sample_rows": sample_rows,
-        "executed_sql": executed_sql,
-        "raw_state": result,
-    }
-
+def tracing_enabled_text() -> str:
+    enabled = os.getenv("LANGCHAIN_TRACING_V2", "").lower() == "true"
+    project = os.getenv("LANGCHAIN_PROJECT", "")
+    # We can’t know the specific run URL here; link to the project home.
+    link = "https://smith.langchain.com/"  # users can navigate by project name
+    if enabled:
+        return f"**Tracing enabled:** True · Project: `{project}` · [Open LangSmith]({link})"
+    return "**Tracing enabled:** False"
 
 # ---------- Sidebar ----------
-st.sidebar.title("⚙️ Settings & Status")
+with st.sidebar:
+    st.markdown("## ⚙️ Settings")
 
-# LangSmith status
-try:
-    tstatus = tracing_status()
-    st.sidebar.markdown("**LangSmith Tracing**")
-    st.sidebar.write(
-        f"- Tracing enabled: **{tstatus['tracing']}**\n"
-        f"- Project: **{tstatus['project']}**\n"
-        f"- API key set: **{tstatus['has_api_key']}**"
-    )
-except Exception:
-    st.sidebar.warning("LangSmith tracing status unavailable.")
+    st.toggle("Dark mode", value=st.session_state.dark_mode, key="dark_mode", on_change=lambda: apply_theme(st.session_state.dark_mode))
 
-# Query counter + thread id
-st.sidebar.markdown("---")
-st.sidebar.metric("Queries this session", st.session_state.query_count)
-st.sidebar.caption(f"Thread: `{st.session_state.thread_id}`")
+    st.markdown("### 🔎 Tracing")
+    st.caption(tracing_enabled_text())
 
-# Prompt templates
-st.sidebar.markdown("---")
-st.sidebar.subheader("Prompt templates")
-TEMPLATES = [
+    st.markdown("---")
+    st.markdown("### 📈 Total Queries")
+    total = get_query_count()
+    query_counter_placeholder = st.metric("All-time executions", total)
+
+# ---------- Header ----------
+st.markdown("## Ask me anything about **bigquery-public-data.thelook_ecommerce** dataset")
+
+st.caption(
+    "This app lets you query the public **TheLook e-commerce** dataset on BigQuery using natural language. "
+    "We focus on the `orders`, `order_items`, `products`, and `users` tables. "
+    "Type a question (e.g., *Analyze sales trends in US in 2022*), or click one of the prompt examples below."
+)
+
+# ---------- Prompt Examples (visible, one-click runs) ----------
+st.markdown("#### Prompt Examples")
+
+examples = [
     "Analyze sales trends in US in 2022",
-    "Analyze sales in China in 2024. Highlight top selling products under $50 and explain what drives sales.",
-    "Identify top 10 product categories by revenue in 2023",
-    "Analyze geographic performance in EMEA in 2022",
-    "Give me the top 10 cities by revenue in United States for 2022",
+    "Analyze sales in China in 2022. Highlight top categories under $50.",
+    "Identify top 5 product categories by revenue in 2023",
+    "Give me the top 10 cities by revenue in 2022 in the United States",
+    "Analyze sales trends in Japan in 2021 and recommend two actions"
 ]
-for i, tpl in enumerate(TEMPLATES, start=1):
-    if st.sidebar.button(f"Template {i}", use_container_width=True):
-        st.session_state["prefill"] = tpl
 
-# ---------- Main UI ----------
-st.title("🛍️ E-commerce LangGraph ReAct Agent")
+cols = st.columns(5)
+example_clicked: Optional[str] = None
+for i, (col, text) in enumerate(zip(cols, examples), start=1):
+    with col:
+        # Full text on the button (no hover)
+        if st.button(text, key=f"example_btn_{i}", use_container_width=True):
+            example_clicked = text
 
-prefill = st.session_state.get("prefill", "")
-query = st.text_area("Enter your question", value=prefill, height=90, placeholder="e.g., Analyze sales trends in US in 2022")
-col_run, col_clear = st.columns([1, 1], vertical_alignment="center")
+# ---------- Main input + run ----------
+st.markdown("#### Your question")
 
-with col_run:
-    run_clicked = st.button("Run", type="primary")
-with col_clear:
-    if st.button("Clear"):
-        st.session_state.history.clear()
-        st.session_state.query_count = 0
-        st.session_state.prefill = ""
+default_q = example_clicked or st.session_state.get("last_query", "")
+query = st.text_area(
+    "Enter your query",
+    value=default_q,
+    key="query_input",
+    height=90,
+    label_visibility="collapsed",
+    placeholder="e.g., Analyze sales trends in US in 2022"
+)
 
-if run_clicked:
+left, right = st.columns([1, 5])
+with left:
+    # Blue primary action
+    ask_btn = st.button("Ask me", type="primary", use_container_width=True)
+
+# If user clicked an example, execute immediately (no extra click needed)
+trigger_run = example_clicked is not None or ask_btn
+
+# ---------- Run + Output ----------
+if trigger_run:
     if not query.strip():
         st.warning("Please enter a query.")
     else:
-        with st.spinner("Running agent…"):
+        # Remember last query
+        st.session_state["last_query"] = query.strip()
+
+        # Show a friendly spinner message
+        with st.spinner("The agents are working on your prompt…"):
+            client, schema, context = bootstrap_context()
             try:
-                result = run_agent_once(query.strip())
-                st.session_state.history.insert(0, {
-                    "query": query.strip(),
-                    "report": result["report"],
-                    "delegated": result["delegated"],
-                    "sample_rows": result["sample_rows"],
-                    "executed_sql": result["executed_sql"],
-                })
-                st.session_state.query_count += 1
+                result = run_agent(query.strip(), schema, context)
+
+                # Increment global counter
+                new_total = increment_query_count()
+                query_counter_placeholder.metric("All-time executions", new_total)
+
+                # Print a small trace of what was executed (debug info)
+                # Safety: only show last 5 tool messages
+                from langchain_core.messages import ToolMessage
+                tool_snips = []
+                for m in result.get("messages", [])[-15:]:
+                    if isinstance(m, ToolMessage):
+                        tid = m.tool_call_id or ""
+                        if any(tid.endswith(sfx) for sfx in ["_sql", "_query"]) or tid in ["manual_metrics", "manual_summary"]:
+                            # Keep brief
+                            content_preview = str(m.content)
+                            if isinstance(content_preview, str) and len(content_preview) > 500:
+                                content_preview = content_preview[:500] + "…"
+                            tool_snips.append(f"- `{tid}`")
+
+                # Separator
+                st.markdown("---")
+                st.markdown("#### Final Report")
+                st.markdown(result["messages"][-1].content)
+
+                # Optional debug trace (collapsed)
+                with st.expander("Show recent tool trace (debug)"):
+                    if tool_snips:
+                        st.markdown("\n".join(tool_snips))
+                    else:
+                        st.markdown("_No recent tool activity recorded._")
+
             except Exception as e:
-                st.error(f"Error: {e}")
-
-# ---------- Results ----------
-if st.session_state.history:
-    latest = st.session_state.history[0]
-    st.subheader("Answer")
-    st.markdown(latest["report"])
-
-    meta_cols = st.columns(2)
-    with meta_cols[0]:
-        st.caption(f"Delegated sub-agent: **{latest.get('delegated') or 'n/a'}**")
-    with meta_cols[1]:
-        st.caption(f"Queries this session: **{st.session_state.query_count}**")
-
-    with st.expander("Preview: sample rows (first tool response)"):
-        if latest["sample_rows"]:
-            st.code(json.dumps(latest["sample_rows"], indent=2))
-        else:
-            st.write("No sample rows detected.")
-
-    with st.expander("Preview: last executed SQL"):
-        if latest["executed_sql"]:
-            st.code(latest["executed_sql"], language="sql")
-        else:
-            st.write("No executed SQL detected.")
-
-    # History below
-    if len(st.session_state.history) > 1:
-        st.markdown("---")
-        st.subheader("History")
-        for idx, h in enumerate(st.session_state.history[1:], start=1):
-            with st.expander(f"{idx}. {h['query'][:80]}"):
-                st.markdown(h["report"])
-                st.caption(f"Delegated: **{h.get('delegated') or 'n/a'}**")
-                if h["sample_rows"]:
-                    st.markdown("**Sample rows:**")
-                    st.code(json.dumps(h["sample_rows"], indent=2))
-                if h["executed_sql"]:
-                    st.markdown("**Executed SQL:**")
-                    st.code(h["executed_sql"], language="sql")
-else:
-    st.info("Enter a question or click a template to get started.")
+                st.error(f"Execution error: {e}")
