@@ -1,73 +1,50 @@
+# streamlit_app.py
 import os
 import json
+import time
 from pathlib import Path
-from typing import Optional
-
 import streamlit as st
+
 from langchain_core.messages import HumanMessage
-from config import get_bq_client, get_schema, get_context
-from agent import compiled_graph
+from config import get_bq_client, get_schema, get_context, get_llm
+from agent import compiled_graph  # uses your existing compiled graph
 
-# ---------- Page & basic styles ----------
-st.set_page_config(
-    page_title="TheLook E-commerce Analyst",
-    page_icon="📊",
-    layout="wide"
-)
+# ---------- Helpers ----------
+COUNTER_FILE = Path("query_counter.txt")
 
-# Simple dark/light toggle using CSS (Streamlit does not hot-swap themes at runtime)
-if "dark_mode" not in st.session_state:
-    st.session_state.dark_mode = False
+def _load_counter() -> int:
+    try:
+        return int(COUNTER_FILE.read_text().strip())
+    except Exception:
+        return 0
 
-def apply_theme(dark: bool):
-    if dark:
-        st.markdown(
-            """
-            <style>
-            html, body, [data-testid="stAppViewContainer"] {
-                background-color: #0E1117 !important;
-                color: #FAFAFA !important;
-            }
-            .stTextInput textarea, .stTextArea textarea, .stTextInput input, .stTextArea, .stButton>button {
-                color: #FAFAFA !important;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True
-        )
-    else:
-        st.markdown(
-            "<style>/* reset custom dark css if any */</style>",
-            unsafe_allow_html=True
-        )
+def _save_counter(val: int) -> None:
+    try:
+        COUNTER_FILE.write_text(str(val))
+    except Exception:
+        pass
 
-apply_theme(st.session_state.dark_mode)
+def _increment_counter() -> int:
+    val = _load_counter() + 1
+    _save_counter(val)
+    return val
 
-# ---------- Utilities ----------
-QUERY_COUNT_PATH = Path("query_count.json")
-
-def get_query_count() -> int:
-    if QUERY_COUNT_PATH.exists():
-        try:
-            return int(json.loads(QUERY_COUNT_PATH.read_text()).get("count", 0))
-        except Exception:
-            return 0
-    return 0
-
-def increment_query_count() -> int:
-    count = get_query_count() + 1
-    QUERY_COUNT_PATH.write_text(json.dumps({"count": count}))
-    return count
+def tracing_status_dict():
+    return {
+        "LANGCHAIN_TRACING_V2": os.getenv("LANGCHAIN_TRACING_V2"),
+        "LANGCHAIN_PROJECT": os.getenv("LANGCHAIN_PROJECT"),
+        "LANGCHAIN_API_KEY_set": bool(os.getenv("LANGCHAIN_API_KEY")),
+    }
 
 @st.cache_resource(show_spinner=False)
-def bootstrap_context():
-    # One-time BigQuery context bootstrap
+def _bootstrap_context():
+    # Create clients and cache schema/context once per app session
     client = get_bq_client()
     schema = json.dumps(get_schema(client))
     context = get_context(client)
     return client, schema, context
 
-def run_agent(user_query: str, schema: str, context: dict):
+def _run_graph(user_query: str, schema: str, context: dict):
     initial_state = {
         "messages": [HumanMessage(content=user_query)],
         "remaining_steps": "",
@@ -75,125 +52,134 @@ def run_agent(user_query: str, schema: str, context: dict):
         "schema": schema,
         "context": context
     }
-    config = {"configurable": {"thread_id": "ui"}}
-    result = compiled_graph.invoke(initial_state, config=config)
-    return result
+    config = {"configurable": {"thread_id": "streamlit"}}
+    return compiled_graph.invoke(initial_state, config=config)
 
-def tracing_enabled_text() -> str:
-    enabled = os.getenv("LANGCHAIN_TRACING_V2", "").lower() == "true"
-    project = os.getenv("LANGCHAIN_PROJECT", "")
-    # We can’t know the specific run URL here; link to the project home.
-    link = "https://smith.langchain.com/"  # users can navigate by project name
-    if enabled:
-        return f"**Tracing enabled:** True · Project: `{project}` · [Open LangSmith]({link})"
-    return "**Tracing enabled:** False"
-
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.markdown("## ⚙️ Settings")
-
-    st.toggle("Dark mode", value=st.session_state.dark_mode, key="dark_mode", on_change=lambda: apply_theme(st.session_state.dark_mode))
-
-    st.markdown("### 🔎 Tracing")
-    st.caption(tracing_enabled_text())
-
-    st.markdown("---")
-    st.markdown("### 📈 Total Queries")
-    total = get_query_count()
-    query_counter_placeholder = st.metric("All-time executions", total)
-
-# ---------- Header ----------
-st.markdown("## Ask me anything about **bigquery-public-data.thelook_ecommerce** dataset")
-
-st.caption(
-    "This app lets you query the public **TheLook e-commerce** dataset on BigQuery using natural language. "
-    "We focus on the `orders`, `order_items`, `products`, and `users` tables. "
-    "Type a question (e.g., *Analyze sales trends in US in 2022*), or click one of the prompt examples below."
+# ---------- Page Config & Simple Theme Toggle ----------
+st.set_page_config(
+    page_title="E-commerce Analytics Agent (LangGraph + BigQuery)",
+    page_icon="📈",
+    layout="wide",
 )
 
-# ---------- Prompt Examples (visible, one-click runs) ----------
-st.markdown("#### Prompt Examples")
+if "theme_mode" not in st.session_state:
+    st.session_state["theme_mode"] = "Light"
 
-examples = [
+col_theme, col_trace = st.columns([1, 2])
+with col_theme:
+    mode = st.toggle("Light / Dark", value=(st.session_state["theme_mode"] == "Dark"))
+    st.session_state["theme_mode"] = "Dark" if mode else "Light"
+
+# Simple CSS to soften UI based on toggle (Streamlit doesn't support runtime theme swap)
+if st.session_state["theme_mode"] == "Dark":
+    st.markdown(
+        """
+        <style>
+            .main { background-color: #0e1117; color: #e0e0e0; }
+            .stButton>button { background-color: #1f6feb !important; color: white !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ---------- Header & Intro ----------
+st.title("E-commerce Analytics Agent (LangGraph + BigQuery)")
+st.caption(
+    "This app lets you ask natural-language questions about the "
+    "`bigquery-public-data.thelook_ecommerce` dataset. We use the `orders`, `order_items`, "
+    "`products`, and `users` tables. The agent (LangGraph + ReAct) plans, validates SQL, queries BigQuery, "
+    "and synthesizes a business-ready report. Click a prompt example or enter your own."
+)
+
+# LangSmith tracing status (inline)
+with col_trace:
+    ts = tracing_status_dict()
+    ok = ts["LANGCHAIN_TRACING_V2"] in ("true", "True", "1") and ts["LANGCHAIN_API_KEY_set"]
+    st.write(
+        f"**Tracing enabled:** {'✅' if ok else '❌'} "
+        f"(Project: `{os.getenv('LANGCHAIN_PROJECT','-')}`)"
+    )
+    if ok:
+        st.caption("Traces stream to your LangSmith project in real time. Open LangSmith to inspect runs.")
+
+st.divider()
+
+# ---------- Load BQ schema/context once ----------
+with st.spinner("Initializing BigQuery context…"):
+    client, schema_json, context_dict = _bootstrap_context()
+
+# ---------- Prompt Examples ----------
+st.subheader("Prompt Examples")
+example_queries = [
     "Analyze sales trends in US in 2022",
-    "Analyze sales in China in 2022. Highlight top categories under $50.",
+    "Analyze sales in China in 2022. Highlight top selling categories and key cities.",
     "Identify top 5 product categories by revenue in 2023",
-    "Give me the top 10 cities by revenue in 2022 in the United States",
-    "Analyze sales trends in Japan in 2021 and recommend two actions"
+    "Analyze sales in Australia in 2021 under $50",
+    "Give me the top cities by revenue in Japan in 2022",
 ]
 
-cols = st.columns(5)
-example_clicked: Optional[str] = None
-for i, (col, text) in enumerate(zip(cols, examples), start=1):
-    with col:
-        # Full text on the button (no hover)
-        if st.button(text, key=f"example_btn_{i}", use_container_width=True):
-            example_clicked = text
+ex_cols = st.columns(len(example_queries))
+example_clicked = None
+for i, q in enumerate(example_queries):
+    # Show the beginning of the prompt on the button (no hover)
+    label = q if len(q) <= 38 else (q[:35] + "…")
+    if ex_cols[i].button(label, key=f"ex_{i}", help=q):
+        example_clicked = q  # trigger auto-run
 
-# ---------- Main input + run ----------
-st.markdown("#### Your question")
+st.divider()
 
-default_q = example_clicked or st.session_state.get("last_query", "")
+# ---------- Query Input & Run ----------
+# Header adjustment per your request: remove "Your Question"; keep just the input
 query = st.text_area(
-    "Enter your query",
-    value=default_q,
-    key="query_input",
-    height=90,
-    label_visibility="collapsed",
-    placeholder="e.g., Analyze sales trends in US in 2022"
+    "Ask me anything about the dataset",
+    placeholder="e.g., Analyze sales trends in US in 2022",
+    height=100,
 )
 
-left, right = st.columns([1, 5])
-with left:
-    # Blue primary action
-    ask_btn = st.button("Ask me", type="primary", use_container_width=True)
+# We use a single primary action
+run_clicked = st.button("Ask me", type="primary")
 
-# If user clicked an example, execute immediately (no extra click needed)
-trigger_run = example_clicked is not None or ask_btn
+# If an example was clicked, auto-run immediately (no second click)
+effective_query = example_clicked or (query.strip() if run_clicked else "")
 
-# ---------- Run + Output ----------
-if trigger_run:
-    if not query.strip():
-        st.warning("Please enter a query.")
-    else:
-        # Remember last query
-        st.session_state["last_query"] = query.strip()
+# ---------- Results Area ----------
+result_container = st.container()
+if effective_query:
+    st.info("The agents are working on your prompt…")
+    try:
+        t0 = time.time()
+        # Run the graph
+        result = _run_graph(effective_query, schema_json, context_dict)
+        elapsed = time.time() - t0
 
-        # Show a friendly spinner message
-        with st.spinner("The agents are working on your prompt…"):
-            client, schema, context = bootstrap_context()
-            try:
-                result = run_agent(query.strip(), schema, context)
+        # Increment global counter AFTER a successful run
+        total = _increment_counter()
 
-                # Increment global counter
-                new_total = increment_query_count()
-                query_counter_placeholder.metric("All-time executions", new_total)
+        # Display output
+        with result_container:
+            st.success(f"Completed in {elapsed:.2f}s · Total queries: {total}")
+            st.markdown("**Final Report:**")
+            st.markdown(result["messages"][-1].content)
 
-                # Print a small trace of what was executed (debug info)
-                # Safety: only show last 5 tool messages
-                from langchain_core.messages import ToolMessage
+            # Small expandable debug (optional)
+            with st.expander("See sample tool outputs (debug)"):
+                # Try to show a few tool messages if present
                 tool_snips = []
-                for m in result.get("messages", [])[-15:]:
-                    if isinstance(m, ToolMessage):
-                        tid = m.tool_call_id or ""
-                        if any(tid.endswith(sfx) for sfx in ["_sql", "_query"]) or tid in ["manual_metrics", "manual_summary"]:
-                            # Keep brief
-                            content_preview = str(m.content)
-                            if isinstance(content_preview, str) and len(content_preview) > 500:
-                                content_preview = content_preview[:500] + "…"
-                            tool_snips.append(f"- `{tid}`")
+                for m in result["messages"]:
+                    if hasattr(m, "tool_call_id") and m.tool_call_id:
+                        tid = m.tool_call_id
+                        if tid.endswith("_sql") or tid.endswith("_query"):
+                            tool_snips.append(f"**{tid}**\n\n```\n{m.content}\n```")
+                if tool_snips:
+                    st.markdown("\n\n".join(tool_snips))
+                else:
+                    st.write("No tool snippets available for this run.")
 
-                # Separator
-                st.markdown("---")
-                st.markdown("#### Final Report")
-                st.markdown(result["messages"][-1].content)
+    except Exception as e:
+        st.error(f"Something went wrong: {e}")
 
-                # Optional debug trace (collapsed)
-                with st.expander("Show recent tool trace (debug)"):
-                    if tool_snips:
-                        st.markdown("\n".join(tool_snips))
-                    else:
-                        st.markdown("_No recent tool activity recorded._")
-
-            except Exception as e:
-                st.error(f"Execution error: {e}")
+# Footer line with lightweight guidance
+st.caption(
+    "Tip: For country-specific queries, the agent automatically joins `users.country` and filters by year "
+    "(using `orders.created_at`)."
+)
