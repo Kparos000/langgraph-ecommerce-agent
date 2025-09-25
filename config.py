@@ -6,7 +6,7 @@ import google.auth
 from google.auth.exceptions import DefaultCredentialsError
 import json
 
-# Load .env robustly (find nearest .env from CWD; allow overrides on re-run)
+# Load .env robustly
 load_dotenv(find_dotenv(usecwd=True), override=True)
 
 def tracing_status() -> dict:

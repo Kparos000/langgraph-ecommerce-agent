@@ -7,7 +7,7 @@ import streamlit as st
 
 from langchain_core.messages import HumanMessage
 from config import get_bq_client, get_schema, get_context, get_llm
-from agent import compiled_graph  # uses your existing compiled graph
+from agent import compiled_graph
 
 # ---------- Helpers ----------
 COUNTER_FILE = Path("query_counter.txt")
@@ -70,7 +70,7 @@ with col_theme:
     mode = st.toggle("Light / Dark", value=(st.session_state["theme_mode"] == "Dark"))
     st.session_state["theme_mode"] = "Dark" if mode else "Light"
 
-# Simple CSS to soften UI based on toggle (Streamlit doesn't support runtime theme swap)
+# Simple CSS to soften UI based on toggle
 if st.session_state["theme_mode"] == "Dark":
     st.markdown(
         """
@@ -129,7 +129,6 @@ for i, q in enumerate(example_queries):
 st.divider()
 
 # ---------- Query Input & Run ----------
-# Header adjustment per your request: remove "Your Question"; keep just the input
 query = st.text_area(
     "Ask me anything about the dataset",
     placeholder="e.g., Analyze sales trends in US in 2022",
@@ -139,7 +138,6 @@ query = st.text_area(
 # We use a single primary action
 run_clicked = st.button("Ask me", type="primary")
 
-# If an example was clicked, auto-run immediately (no second click)
 effective_query = example_clicked or (query.strip() if run_clicked else "")
 
 # ---------- Results Area ----------
