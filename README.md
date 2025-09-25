@@ -172,7 +172,7 @@ Together, these strategies combine deterministic safeguards, LLM introspection, 
 - Output format and error trace verification
 
 ```shell
-pytest tests/
+pytest -q tests/test_errors.py
 ```
 Results must meet the project’s targets for speed, validity, and interpretability.[1]
 
